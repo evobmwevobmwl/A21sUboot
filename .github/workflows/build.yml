@@ -1,5 +1,5 @@
 
-name: A21s U-Boot Research Build
+name: Samsung Galaxy A21s U-Boot Build
 
 on:
   workflow_dispatch:
@@ -15,110 +15,182 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  inspect-and-build:
+  build:
+    name: Build SM-A217F for Exynos 850
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     steps:
-      - name: Checkout workflow
+      - name: Checkout workflow repository
         uses: actions/checkout@v4
 
       - name: Show runner resources
         run: |
+          echo "=== CPU ==="
           nproc
+          echo "=== Memory ==="
           free -h
+          echo "=== Disk ==="
           df -h /
 
-      - name: Install toolchain
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential gcc-aarch64-linux-gnu \
+            build-essential \
+            gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            bc bison flex libssl-dev \
-            libgnutls28-dev device-tree-compiler \
-            python3 python3-dev python3-setuptools \
-            swig git ccache
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libgnutls28-dev \
+            device-tree-compiler \
+            python3 \
+            python3-dev \
+            python3-setuptools \
+            python3-pyelftools \
+            swig \
+            git \
+            ccache
 
-      - name: Enable compiler cache
+      - name: Configure compiler cache
         uses: actions/cache@v4
         with:
           path: ~/.cache/ccache
-          key: uboot-ccache-${{ runner.os }}-${{ github.run_id }}
+          key: a21s-ccache-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            uboot-ccache-${{ runner.os }}-
+            a21s-ccache-${{ runner.os }}-
 
-      - name: Configure ccache
+      - name: Set cache environment
         run: |
           echo "CCACHE_DIR=$HOME/.cache/ccache" >> "$GITHUB_ENV"
           ccache --set-config=max_size=2G
-          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> "$GITHUB_ENV"
-          echo "CC=ccache aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          ccache --zero-stats
 
-      - name: Clone community U-Boot
+      - name: Clone Exynos850 U-Boot
         run: |
           git clone --depth=1 \
             https://github.com/samsungexynos850/u-boot.git \
             source
-          git -C source log -1 --format='%H %s' \
+
+          git -C source rev-parse HEAD \
             | tee source-commit.txt
 
-      - name: Inspect configs and device trees
-        run: |
-          cd source
-          {
-            echo "=== Exynos mobile config ==="
-            test -f configs/exynos-mobile_defconfig \
-              && echo FOUND || echo MISSING
-            echo "=== Exynos850 DTS candidates ==="
-            find arch/arm/dts -type f \
-              | grep -Ei 'e850|exynos850|a217' || true
-            echo "=== Config candidates ==="
-            find configs -maxdepth 1 -type f \
-              | grep -Ei 'exynos.*(850|mobile)' || true
-          } | tee ../inspection.log
+          git -C source log -1 --format='%s' \
+            | tee source-description.txt
 
-      - name: Build generic Exynos mobile target
+      - name: Inspect Galaxy A21s support
+        run: |
+          set -eu
+
+          cd source
+
+          echo "=== A21s defconfig ==="
+          test -f configs/e850-96_defconfig
+
+          echo "=== A21s Device Tree ==="
+          test -f \
+            dts/upstream/src/arm64/exynos/exynos850-a217f.dts
+
+          echo "=== Related DTS and configuration files ==="
+          find configs dts/upstream/src/arm64/exynos \
+            -maxdepth 2 -type f \
+            | grep -Ei 'e850-96|a217f|exynos850' \
+            | sort \
+            | tee ../inspection.log
+
+      - name: Configure U-Boot for A21s
         run: |
           set -euxo pipefail
-          cd source
-          test -f configs/exynos-mobile_defconfig
-          make O=build exynos-mobile_defconfig
-          DTS="$(find arch/arm/dts -type f \
-            -name '*e850-96*.dts' -print -quit)"
-          if [ -z "$DTS" ]; then
-            echo "No E850-96 DTS found; refusing to guess target"
-            exit 2
-          fi
-          DEVICE_TREE="${DTS##*/}"
-          DEVICE_TREE="${DEVICE_TREE%.dts}"
-          make O=build \
-            DEVICE_TREE="$DEVICE_TREE" \
-            -j"$(nproc)"
-          mkdir -p ../artifacts
-          cp build/u-boot.bin ../artifacts/
-          cp build/.config ../artifacts/uboot.config
-          cp "$DTS" ../artifacts/
-          ccache -s | tee ../artifacts/ccache-stats.txt
 
-      - name: Upload diagnostic logs
+          cd source
+
+          make O=build e850-96_defconfig
+
+          echo "=== Selected configuration ==="
+          grep -E \
+            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_SYS_TEXT_BASE|CONFIG_ARCH_EXYNOS)' \
+            build/.config || true
+
+          grep -q \
+            '^CONFIG_DEFAULT_DEVICE_TREE="exynos/exynos850-a217f"$' \
+            build/.config
+
+      - name: Build U-Boot
+        run: |
+          set -euxo pipefail
+
+          cd source
+
+          make O=build \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)"
+
+          echo "=== Build outputs ==="
+          find build -type f \
+            \( -name 'u-boot*' -o -name '*.dtb' -o -name '*.itb' \) \
+            -print
+
+      - name: Collect build artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          if [ -d source/build ]; then
+            cp source/build/.config \
+              artifacts/uboot.config 2>/dev/null || true
+
+            find source/build -type f \
+              \( -name 'u-boot.bin' \
+              -o -name 'u-boot-dtb.bin' \
+              -o -name 'u-boot-nodtb.bin' \
+              -o -name 'u-boot.dtb' \
+              -o -name 'u-boot.itb' \
+              -o -name 'u-boot.img' \
+              -o -name '*.map' \) \
+              -exec cp -v {} artifacts/ \; || true
+          fi
+
+          if [ -f source/dts/upstream/src/arm64/exynos/exynos850-a217f.dts ]; then
+            cp source/dts/upstream/src/arm64/exynos/exynos850-a217f.dts \
+              artifacts/
+          fi
+
+          if [ -f source-commit.txt ]; then
+            cp source-commit.txt artifacts/
+          fi
+
+          if [ -f source-description.txt ]; then
+            cp source-description.txt artifacts/
+          fi
+
+          if [ -f inspection.log ]; then
+            cp inspection.log artifacts/
+          fi
+
+          {
+            echo "Device: Samsung Galaxy A21s SM-A217F"
+            echo "SoC: Exynos 850"
+            echo "RAM variant: 3 GB"
+            echo "Build is experimental; not verified for flashing."
+            echo "Date (UTC): $(date -u +%FT%TZ)"
+            echo
+            echo "Available artifacts:"
+            ls -lh artifacts/ || true
+          } > artifacts/build-info.txt
+
+      - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: a21s-uboot-diagnostics
-          path: |
-            inspection.log
-            source-commit.txt
-            source/build/.config
-          if-no-files-found: ignore
-
-      
-      
-      - name: Upload binaries
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: exynos850-test-build
+          name: a21s-exynos850-uboot
           path: artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Print compiler cache statistics
+        if: always()
+        run: |
+          ccache -s || true
           
