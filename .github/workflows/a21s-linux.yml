@@ -1,1 +1,145 @@
 
+name: Build A21s Mainline Linux
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/a21s-linux.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ca-certificates \
+            curl flex gcc-aarch64-linux-gnu \
+            git libelf-dev libssl-dev python3 \
+            rsync dwarves device-tree-compiler \
+            xz-utils zstd
+
+      - name: Get upstream Linux
+        run: |
+          git clone --depth=1 \
+            https://github.com/torvalds/linux.git linux
+          cd linux
+          git rev-parse HEAD > ../kernel-commit.txt
+
+      - name: Check A21s Device Tree
+        run: |
+          cd linux
+          test -f \
+            arch/arm64/boot/dts/exynos/exynos850-a217f.dts
+          grep -n "model\|compatible" \
+            arch/arm64/boot/dts/exynos/exynos850-a217f.dts \
+            | head -20
+
+      - name: Configure kernel
+        run: |
+          cd linux
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            exynos_defconfig
+
+          scripts/config --enable CONFIG_MODULES
+          scripts/config --enable CONFIG_DEVTMPFS
+          scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          scripts/config --enable CONFIG_TMPFS
+          scripts/config --enable CONFIG_BLK_DEV_INITRD
+          scripts/config --enable CONFIG_EXT4_FS
+          scripts/config --enable CONFIG_VFAT_FS
+          scripts/config --enable CONFIG_MMC
+          scripts/config --enable CONFIG_MMC_BLOCK
+          scripts/config --enable CONFIG_USB
+          scripts/config --enable CONFIG_USB_GADGET
+          scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
+          scripts/config --enable CONFIG_DRM
+          scripts/config --enable CONFIG_DRM_SIMPLEDRM
+
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          cp .config ../kernel.config
+
+      - name: Build kernel, DTBs and modules
+        run: |
+          cd linux
+          make -j2 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image dtbs modules
+
+          test -s arch/arm64/boot/Image
+          test -s \
+            arch/arm64/boot/dts/exynos/exynos850-a217f.dtb
+
+          make -j2 ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules" \
+            modules_install
+
+      - name: Prepare Alpine ARM64 rootfs
+        run: |
+          set -eu
+          mkdir -p out/alpine
+
+          INDEX="https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64"
+
+          FILE="$(curl -fsSL "$INDEX/" \
+            | grep -oE 'alpine-minirootfs-[0-9.]+-aarch64.tar.gz' \
+            | sort -Vu | tail -n1)"
+
+          test -n "$FILE"
+          curl -fL "$INDEX/$FILE" \
+            -o out/alpine/alpine-minirootfs.tar.gz
+
+          echo "$FILE" > out/alpine/source-version.txt
+          sha256sum out/alpine/alpine-minirootfs.tar.gz \
+            > out/alpine/SHA256SUMS
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out/kernel
+
+          cp linux/arch/arm64/boot/Image out/kernel/
+          cp linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb \
+            out/kernel/
+          cp linux/System.map out/kernel/
+          cp kernel.config out/kernel/
+          cp kernel-commit.txt out/kernel/
+
+          {
+            echo "Device: Samsung Galaxy A21s SM-A217F"
+            echo "SoC: Samsung Exynos 850"
+            echo "RAM: 3 GB"
+            echo "Architecture: ARM64"
+            echo "Kernel: upstream Linux"
+            echo "Status: build output only; boot not verified"
+          } > out/kernel/build-info.txt
+
+      - name: Upload kernel and modules
+        uses: actions/upload-artifact@v4
+        with:
+          name: a21s-linux-kernel
+          path: |
+            out/kernel/
+            out/modules/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Alpine rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpine-aarch64-rootfs
+          path: out/alpine/
+          if-no-files-found: error
+          retention-days: 14
+
