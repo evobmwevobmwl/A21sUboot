@@ -1,4 +1,6 @@
-name: Build A21s Mainline Linuxon:
+name: Build A21s Mainline Linux
+
+on:
   workflow_dispatch:
   push:
     paths:
@@ -139,4 +141,3 @@ jobs:
           path: out/alpine/
           if-no-files-found: error
           retention-days: 14
-
