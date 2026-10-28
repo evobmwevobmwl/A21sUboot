@@ -112,11 +112,13 @@ jobs:
             source/build/.config
           if-no-files-found: ignore
 
+      
+      
       - name: Upload binaries
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: exynos850-test-build
           path: artifacts/
-          if-no-fil
-          es-found: error
+          if-no-files-found: error
+          
