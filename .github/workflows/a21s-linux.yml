@@ -1,7 +1,4 @@
-
-name: Build A21s Mainline Linux
-
-on:
+name: Build A21s Mainline Linuxon:
   workflow_dispatch:
   push:
     paths:
