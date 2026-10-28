@@ -1,3 +1,4 @@
+
 name: Build A21s Mainline Linux
 
 on:
@@ -25,29 +26,39 @@ jobs:
             rsync dwarves device-tree-compiler \
             xz-utils zstd
 
-      - name: Get upstream Linux
+      - name: Clone Exynos850 Linux
         run: |
           git clone --depth=1 \
-            https://github.com/torvalds/linux.git linux
+            https://github.com/samsungexynos850/linux.git linux
           cd linux
           git rev-parse HEAD > ../kernel-commit.txt
 
-      - name: Check A21s Device Tree
+      - name: Verify A21s Device Tree
         run: |
+          set -eu
           cd linux
-          test -f \
-            arch/arm64/boot/dts/exynos/exynos850-a217f.dts
-          grep -n "model\|compatible" \
-            arch/arm64/boot/dts/exynos/exynos850-a217f.dts \
-            | head -20
 
-      - name: Configure kernel
+          DTS=arch/arm64/boot/dts/exynos/exynos850-a217f.dts
+
+          if [ ! -f "$DTS" ]; then
+            echo "::error::A21s DTS is missing in this branch."
+            echo "Available Exynos850 DTS files:"
+            find arch/arm64/boot/dts -iname '*850*' -type f
+            exit 1
+          fi
+
+          grep -nE 'model|compatible' "$DTS" | head -30
+
+      - name: Configure ARM64 kernel
         run: |
+          set -eu
           cd linux
+
           make ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            exynos_defconfig
+            defconfig
 
+          scripts/config --enable CONFIG_ARCH_EXYNOS
           scripts/config --enable CONFIG_MODULES
           scripts/config --enable CONFIG_DEVTMPFS
           scripts/config --enable CONFIG_DEVTMPFS_MOUNT
@@ -58,7 +69,6 @@ jobs:
           scripts/config --enable CONFIG_MMC
           scripts/config --enable CONFIG_MMC_BLOCK
           scripts/config --enable CONFIG_USB
-          scripts/config --enable CONFIG_USB_GADGET
           scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
           scripts/config --enable CONFIG_DRM
           scripts/config --enable CONFIG_DRM_SIMPLEDRM
@@ -71,7 +81,9 @@ jobs:
 
       - name: Build kernel, DTBs and modules
         run: |
+          set -eu
           cd linux
+
           make -j2 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             Image dtbs modules
@@ -80,12 +92,14 @@ jobs:
           test -s \
             arch/arm64/boot/dts/exynos/exynos850-a217f.dtb
 
+          mkdir -p "$GITHUB_WORKSPACE/out/modules"
+
           make -j2 ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             INSTALL_MOD_PATH="$GITHUB_WORKSPACE/out/modules" \
             modules_install
 
-      - name: Prepare Alpine ARM64 rootfs
+      - name: Prepare Alpine ARM64 rootfs archive
         run: |
           set -eu
           mkdir -p out/alpine
@@ -96,16 +110,22 @@ jobs:
             | grep -oE 'alpine-minirootfs-[0-9.]+-aarch64.tar.gz' \
             | sort -Vu | tail -n1)"
 
-          test -n "$FILE"
+          if [ -z "$FILE" ]; then
+            echo "::error::Could not find Alpine ARM64 minirootfs."
+            exit 1
+          fi
+
           curl -fL "$INDEX/$FILE" \
             -o out/alpine/alpine-minirootfs.tar.gz
 
           echo "$FILE" > out/alpine/source-version.txt
-          sha256sum out/alpine/alpine-minirootfs.tar.gz \
-            > out/alpine/SHA256SUMS
 
-      - name: Collect artifacts
+          cd out/alpine
+          sha256sum alpine-minirootfs.tar.gz > SHA256SUMS
+
+      - name: Collect kernel artifacts
         run: |
+          set -eu
           mkdir -p out/kernel
 
           cp linux/arch/arm64/boot/Image out/kernel/
@@ -117,12 +137,17 @@ jobs:
 
           {
             echo "Device: Samsung Galaxy A21s SM-A217F"
-            echo "SoC: Samsung Exynos 850"
-            echo "RAM: 3 GB"
+            echo "SoC: Exynos 850"
+            echo "RAM target: 3 GB"
             echo "Architecture: ARM64"
-            echo "Kernel: upstream Linux"
-            echo "Status: build output only; boot not verified"
+            echo "Kernel source: samsungexynos850/linux"
+            echo "Boot status: not tested on hardware"
           } > out/kernel/build-info.txt
+
+          file out/kernel/Image
+          file out/kernel/exynos850-a217f.dtb
+          sha256sum out/kernel/Image \
+            out/kernel/exynos850-a217f.dtb
 
       - name: Upload kernel and modules
         uses: actions/upload-artifact@v4
@@ -141,3 +166,4 @@ jobs:
           path: out/alpine/
           if-no-files-found: error
           retention-days: 14
+          
