@@ -40,9 +40,11 @@ jobs:
             binutils-aarch64-linux-gnu \
             bison \
             build-essential \
+            cpio \
             device-tree-compiler \
             flex \
             gcc-aarch64-linux-gnu \
+            gzip \
             libelf-dev \
             libncurses-dev \
             libssl-dev \
@@ -93,6 +95,22 @@ jobs:
 
           file uniloader/blob/Image uniloader/blob/dtb
           sha256sum uniloader/blob/Image uniloader/blob/dtb
+
+          # uniLoader's A21s defconfig requires a ramdisk blob at link time.
+          # This empty initramfs only satisfies that build input; it is not
+          # Alpine rootfs and does not implement USB root discovery.
+          mkdir -p "$RUNNER_TEMP/empty-initramfs/dev" \
+            "$RUNNER_TEMP/empty-initramfs/root"
+          (
+            cd "$RUNNER_TEMP/empty-initramfs"
+            find . -print0 \
+              | LC_ALL=C sort -z \
+              | cpio --null --create --format=newc \
+                  --owner=0:0 --quiet
+          ) | gzip -n -9 > uniloader/blob/ramdisk
+
+          file uniloader/blob/ramdisk
+          sha256sum uniloader/blob/ramdisk
 
           if [ -f kernel-artifact/kernel-commit.txt ]; then
             cp kernel-artifact/kernel-commit.txt .
@@ -152,6 +170,7 @@ jobs:
           cp kernel-commit.txt artifacts/ 2>/dev/null || true
           cp uniloader/blob/Image artifacts/ 2>/dev/null || true
           cp uniloader/blob/dtb artifacts/ 2>/dev/null || true
+          cp uniloader/blob/ramdisk artifacts/ 2>/dev/null || true
 
           {
             echo "Target: Samsung Galaxy A21s SM-A217F"
@@ -159,6 +178,7 @@ jobs:
             echo "uniLoader source: samsungexynos850/uniLoader"
             echo "Configuration: a21s_defconfig"
             echo "Kernel source artifact run: $KERNEL_RUN_ID"
+            echo "Ramdisk: empty build placeholder; not an Alpine rootfs"
             echo "Build status is reported by this workflow run."
             echo
             echo "Collected outputs:"
