@@ -230,8 +230,8 @@ jobs:
           echo "=== Verify compiled A21s USB host mode ==="
           dtb=$(find build -type f -name u-boot.dtb -print -quit)
           test -n "$dtb"
-          test "$(fdtget -t s "$dtb" /usb@13600000/usb@0 dr_mode)" = host
-          fdtget -t s "$dtb" /usb@13600000/usb@0 dr_mode
+          test "$(fdtget -t s "$dtb" /soc@0/usb@13600000/usb@0 dr_mode)" = host
+          fdtget -t s "$dtb" /soc@0/usb@13600000/usb@0 dr_mode
 
           echo "=== Build outputs ==="
           find build -type f \
