@@ -6,7 +6,6 @@ on:
   push:
     paths:
       - ".github/workflows/build.yml"
-      - ".github/a21s-usb-boot.patch"
 
 permissions:
   contents: read
@@ -85,11 +84,21 @@ jobs:
         run: |
           set -eu
 
-          git -C source apply --check ../.github/a21s-usb-boot.patch
-          git -C source apply ../.github/a21s-usb-boot.patch
+          env_file=source/board/samsung/e850-96/e850-96.env
+          test -f "$env_file"
+
+          if grep -qE '^(boot_targets|bootcmd)=' "$env_file"; then
+            echo "::error::Upstream already defines boot_targets or bootcmd."
+            exit 1
+          fi
+
+          cat >> "$env_file" <<'EOF'
+          boot_targets=usb0 mmc
+          bootcmd=usb start; bootflow scan -lb
+          EOF
 
           grep -nE '^(boot_targets|bootcmd)=' \
-            source/board/samsung/e850-96/e850-96.env
+            "$env_file"
 
       - name: Inspect Galaxy A21s support
         run: |
