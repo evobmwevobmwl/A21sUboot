@@ -71,9 +71,12 @@ jobs:
 
       - name: Clone Exynos850 U-Boot
         run: |
-          git clone --depth=1 \
-            https://github.com/samsungexynos850/u-boot.git \
-            source
+          git init source
+          git -C source remote add origin \
+            https://github.com/samsungexynos850/u-boot.git
+          git -C source fetch --depth=1 origin \
+            753a0e33c29168e323a2341bd627d65a707c7f27
+          git -C source checkout --detach FETCH_HEAD
 
           git -C source rev-parse HEAD \
             | tee source-commit.txt

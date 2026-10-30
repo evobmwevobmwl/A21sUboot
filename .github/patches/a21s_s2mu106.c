@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+
 /* A21s-specific S2MU106 OTG source detection and VBUS enable. */
 
-#include <common.h>
 #include <i2c.h>
+#include <stdio.h>
 
 #define A21S_S2MU106_PDIC_ADDR 0x3c
 #define A21S_S2MU106_CHARGER_ADDR 0x3d
