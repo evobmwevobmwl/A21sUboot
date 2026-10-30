@@ -1,0 +1,175 @@
+name: Build A21s uniLoader
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_run_id:
+        description: Successful A21s Linux workflow run containing Image and DTB
+        required: true
+        default: '40764327953'
+        type: string
+  push:
+    paths:
+      - .github/workflows/build-uniloader.yml
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: a21s-uniloader-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build uniLoader for SM-A217F
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      KERNEL_RUN_ID: ${{ github.event.inputs.kernel_run_id || '40764327953' }}
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            binutils-aarch64-linux-gnu \
+            bison \
+            build-essential \
+            device-tree-compiler \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            python3 \
+            python3-setuptools \
+            rsync
+
+      - name: Fetch uniLoader source
+        run: |
+          set -eu
+
+          git init uniloader
+          git -C uniloader remote add origin \
+            https://github.com/samsungexynos850/uniLoader.git
+          git -C uniloader fetch --depth=1 origin \
+            06a1bba90f6f00f4a3f745eb072c54e2190c0832
+          git -C uniloader checkout --detach FETCH_HEAD
+          git -C uniloader rev-parse HEAD | tee uniloader-commit.txt
+
+          test -f uniloader/configs/a21s_defconfig
+
+      - name: Download successful A21s kernel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: a21s-linux-kernel
+          path: kernel-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ env.KERNEL_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Stage kernel and A21s DTB blobs
+        run: |
+          set -euo pipefail
+
+          image="$(find kernel-artifact -type f -name Image -print -quit)"
+          dtb="$(find kernel-artifact -type f \
+            -name exynos850-a217f.dtb -print -quit)"
+
+          if [ -z "$image" ] || [ -z "$dtb" ]; then
+            echo "::error::Kernel artifact is missing A21s Image or DTB."
+            find kernel-artifact -maxdepth 4 -type f -print | sort
+            exit 1
+          fi
+
+          mkdir -p uniloader/blob
+          cp "$image" uniloader/blob/Image
+          cp "$dtb" uniloader/blob/dtb
+
+          file uniloader/blob/Image uniloader/blob/dtb
+          sha256sum uniloader/blob/Image uniloader/blob/dtb
+
+          if [ -f kernel-artifact/kernel-commit.txt ]; then
+            cp kernel-artifact/kernel-commit.txt .
+          elif [ -f kernel-artifact/kernel/kernel-commit.txt ]; then
+            cp kernel-artifact/kernel/kernel-commit.txt .
+          fi
+
+      - name: Configure uniLoader A21s target
+        run: |
+          set -euxo pipefail
+
+          build_dir="$RUNNER_TEMP/uniloader-build"
+          mkdir -p "$build_dir"
+
+          make -C uniloader \
+            O="$build_dir" \
+            ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            a21s_defconfig
+
+          echo "=== Selected uniLoader paths ==="
+          grep -E \
+            '^(CONFIG_(KERNEL_PATH|DT_PATH|RAMDISK_PATH|TEXT_BASE|CROSS_COMPILE))=' \
+            "$build_dir/.config" || true
+
+          cp "$build_dir/.config" uniloader.config
+
+      - name: Build uniLoader
+        run: |
+          set -euxo pipefail
+
+          make -C uniloader \
+            O="$RUNNER_TEMP/uniloader-build" \
+            ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)"
+
+      - name: Collect build outputs and metadata
+        if: always()
+        run: |
+          mkdir -p artifacts
+
+          if [ -d "$RUNNER_TEMP/uniloader-build" ]; then
+            cp "$RUNNER_TEMP/uniloader-build/.config" \
+              artifacts/uniloader.config 2>/dev/null || true
+            find "$RUNNER_TEMP/uniloader-build" -type f \
+              \( -name '*.bin' -o -name '*.elf' -o -name '*.img' \
+              -o -name '*.itb' \) \
+              -exec cp --parents {} artifacts/ \; || true
+            find "$RUNNER_TEMP/uniloader-build" -type f -printf '%p %s bytes\n' \
+              | sort > artifacts/build-file-list.txt
+            tar -C "$RUNNER_TEMP/uniloader-build" \
+              -czf artifacts/uniloader-build-tree.tar.gz . || true
+          fi
+
+          cp uniloader-commit.txt artifacts/ 2>/dev/null || true
+          cp kernel-commit.txt artifacts/ 2>/dev/null || true
+          cp uniloader/blob/Image artifacts/ 2>/dev/null || true
+          cp uniloader/blob/dtb artifacts/ 2>/dev/null || true
+
+          {
+            echo "Target: Samsung Galaxy A21s SM-A217F"
+            echo "Architecture: ARM64"
+            echo "uniLoader source: samsungexynos850/uniLoader"
+            echo "Configuration: a21s_defconfig"
+            echo "Kernel source artifact run: $KERNEL_RUN_ID"
+            echo "Build status is reported by this workflow run."
+            echo
+            echo "Collected outputs:"
+            ls -lh artifacts/ || true
+          } > artifacts/build-info.txt
+
+      - name: Upload uniLoader build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a21s-uniloader
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
