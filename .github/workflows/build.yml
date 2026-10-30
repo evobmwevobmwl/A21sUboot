@@ -80,25 +80,25 @@ jobs:
           git -C source log -1 --format='%s' \
             | tee source-description.txt
 
-      - name: Configure USB-first boot with MMC fallback
+      - name: Configure automatic USB-first boot with MMC fallback
         run: |
           set -eu
 
           env_file=source/board/samsung/e850-96/e850-96.env
           test -f "$env_file"
 
-          if grep -qE '^(boot_targets|bootcmd)=' "$env_file"; then
-            echo "::error::Upstream already defines boot_targets or bootcmd."
+          if grep -q '^boot_targets=' "$env_file"; then
+            echo "::error::Upstream already defines boot_targets."
             exit 1
           fi
 
+          # The unnumbered "usb" label scans all USB mass-storage devices;
+          # bootflow's USB hunter initializes the host controller itself.
           cat >> "$env_file" <<'EOF'
-          boot_targets=usb0 mmc
-          bootcmd=usb start; bootflow scan -lb
+          boot_targets=usb mmc
           EOF
 
-          grep -nE '^(boot_targets|bootcmd)=' \
-            "$env_file"
+          grep -n '^boot_targets=' "$env_file"
 
       - name: Inspect Galaxy A21s support
         run: |
@@ -149,6 +149,7 @@ jobs:
           grep -q '^CONFIG_USB_STORAGE=y$' build/.config
           grep -q '^CONFIG_BOOTMETH_EXTLINUX=y$' build/.config
           grep -q '^CONFIG_ENV_IS_NOWHERE=y$' build/.config
+          grep -q '^CONFIG_BOOTCOMMAND="bootflow scan -lb"$' build/.config
           ! grep -q '^CONFIG_ENV_IS_IN_MMC=y$' build/.config
           ! grep -q '^CONFIG_CMD_DFU=y$' build/.config
           ! grep -q '^CONFIG_USB_FUNCTION_FASTBOOT=y$' build/.config
@@ -163,6 +164,12 @@ jobs:
           make O=build \
             CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$(nproc)"
+
+          echo "=== Verify embedded autoboot defaults ==="
+          strings build/u-boot.bin | grep -Fx 'boot_targets=usb mmc'
+          strings build/u-boot.bin | grep -Fx 'bootcmd=bootflow scan -lb'
+          ! strings build/u-boot.bin | \
+            grep -Fx 'bootcmd=usb start; bootflow scan -lb'
 
           echo "=== Build outputs ==="
           find build -type f \
@@ -210,7 +217,7 @@ jobs:
             echo "Device: Samsung Galaxy A21s SM-A217F"
             echo "SoC: Exynos 850"
             echo "RAM variant: 3 GB"
-            echo "Autoboot: USB extlinux first, then all available MMC devices"
+            echo "Autoboot: automatic scan of all USB storage first, then all available MMC devices"
             echo "U-Boot environment: RAM-only; no eMMC save"
             echo "Interactive buttons: not required for autoboot"
             echo "Build is experimental; not verified for flashing."
