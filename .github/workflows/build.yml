@@ -6,6 +6,7 @@ on:
   push:
     paths:
       - ".github/workflows/build.yml"
+      - ".github/patches/**"
 
 permissions:
   contents: read
@@ -80,9 +81,12 @@ jobs:
           git -C source log -1 --format='%s' \
             | tee source-description.txt
 
-      - name: Configure A21s USB host, timer, and automatic boot
+      - name: Configure A21s USB, S2MU106 VBUS, timer, and automatic boot
         run: |
           set -eu
+
+          python3 "$GITHUB_WORKSPACE/.github/patches/enable_s2mu106.py" source
+          git -C source diff --check
 
           env_file=source/board/samsung/e850-96/e850-96.env
           test -f "$env_file"
@@ -92,10 +96,11 @@ jobs:
             exit 1
           fi
 
-          # Scan USB mass storage before MMC and skip the non-responsive prompt.
+          # Enable VBUS only when S2MU106 reports the phone as USB source/host.
+          # Keep a visible countdown while USB enumeration is being tested.
           cat >> "$env_file" <<'EOF'
           boot_targets=usb mmc
-          bootdelay=0
+          bootdelay=5
           EOF
 
           grep -nE '^boot_(targets|delay)=' "$env_file"
@@ -181,6 +186,9 @@ jobs:
             --set-val COUNTER_FREQUENCY 26000000
 
           scripts/config --file build/.config \
+            --enable SYS_I2C_S3C24X0
+
+          scripts/config --file build/.config \
             --disable ENV_IS_IN_MMC \
             --disable CMD_DFU \
             --disable USB_FUNCTION_FASTBOOT \
@@ -191,12 +199,13 @@ jobs:
 
           echo "=== Selected configuration ==="
           grep -E \
-            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_COUNTER_FREQUENCY|CONFIG_USB_HOST|CONFIG_USB_STORAGE|CONFIG_USB_XHCI_HCD|CONFIG_USB_XHCI_DWC3|CONFIG_USB_DWC3_GENERIC|CONFIG_PHY_EXYNOS_USBDRD|CONFIG_BOOTMETH_EXTLINUX|CONFIG_ENV_IS_NOWHERE)' \
+            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_COUNTER_FREQUENCY|CONFIG_SYS_I2C_S3C24X0|CONFIG_USB_HOST|CONFIG_USB_STORAGE|CONFIG_USB_XHCI_HCD|CONFIG_USB_XHCI_DWC3|CONFIG_USB_DWC3_GENERIC|CONFIG_PHY_EXYNOS_USBDRD|CONFIG_BOOTMETH_EXTLINUX|CONFIG_ENV_IS_NOWHERE)' \
             build/.config || true
 
           grep -q \
             '^CONFIG_DEFAULT_DEVICE_TREE="exynos/exynos850-a217f"$' \
             build/.config
+          grep -q '^CONFIG_SYS_I2C_S3C24X0=y$' build/.config
           grep -q '^CONFIG_USB_HOST=y$' build/.config
           grep -q '^CONFIG_USB_STORAGE=y$' build/.config
           grep -q '^CONFIG_USB_XHCI_HCD=y$' build/.config
@@ -224,7 +233,9 @@ jobs:
 
           echo "=== Verify embedded autoboot defaults ==="
           strings build/u-boot.bin | grep -Fx 'boot_targets=usb mmc'
-          strings build/u-boot.bin | grep -Fx 'bootdelay=0'
+          strings build/u-boot.bin | grep -Fx 'bootdelay=5'
+          strings build/u-boot.bin | grep -F 'A21s OTG: S2MU106 PLUG_MON2=0x%02x'
+          strings build/u-boot.bin | grep -Fx 'A21s OTG: source role confirmed; S2MU106 VBUS boost enabled'
           strings build/u-boot.bin | grep -Fx 'bootcmd=bootflow scan -lb'
 
           echo "=== Verify compiled A21s USB host mode ==="
@@ -232,6 +243,8 @@ jobs:
           test -n "$dtb"
           test "$(fdtget -t s "$dtb" /soc@0/usb@13600000/usb@0 dr_mode)" = host
           fdtget -t s "$dtb" /soc@0/usb@13600000/usb@0 dr_mode
+          test "$(fdtget -t s "$dtb" /soc@0/i2c@13830000 status)" = okay
+          fdtget -t s "$dtb" /soc@0/i2c@13830000 status
 
           echo "=== Build outputs ==="
           find build -type f \
@@ -280,10 +293,10 @@ jobs:
             echo "SoC: Exynos 850"
             echo "RAM variant: 3 GB"
             echo "Autoboot: automatic scan of USB mass storage first, then MMC"
-            echo "USB controller: forced host mode for A21s OTG port"
+            echo "USB controller: host mode with S2MU106 source-role-gated VBUS"
             echo "System counter: 26000000 Hz fallback for Samsung boot firmware"
             echo "U-Boot environment: RAM-only; no eMMC save"
-            echo "Interactive buttons: not required for autoboot"
+            echo "Autoboot delay: 5 seconds for diagnostics"
             echo "Build is experimental; not verified for flashing."
             echo "Date (UTC): $(date -u +%FT%TZ)"
             echo
