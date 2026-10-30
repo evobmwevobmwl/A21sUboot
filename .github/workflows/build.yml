@@ -6,6 +6,7 @@ on:
   push:
     paths:
       - ".github/workflows/build.yml"
+      - ".github/a21s-usb-boot.patch"
 
 permissions:
   contents: read
@@ -80,6 +81,16 @@ jobs:
           git -C source log -1 --format='%s' \
             | tee source-description.txt
 
+      - name: Configure USB-first boot with MMC fallback
+        run: |
+          set -eu
+
+          git -C source apply --check ../.github/a21s-usb-boot.patch
+          git -C source apply ../.github/a21s-usb-boot.patch
+
+          grep -nE '^(boot_targets|bootcmd)=' \
+            source/board/samsung/e850-96/e850-96.env
+
       - name: Inspect Galaxy A21s support
         run: |
           set -eu
@@ -108,14 +119,31 @@ jobs:
 
           make O=build e850-96_defconfig
 
+          scripts/config --file build/.config \
+            --disable ENV_IS_IN_MMC \
+            --disable CMD_DFU \
+            --disable USB_FUNCTION_FASTBOOT \
+            --disable FASTBOOT_FLASH \
+            --disable FASTBOOT_CMD_OEM_FORMAT
+
+          make O=build olddefconfig
+
           echo "=== Selected configuration ==="
           grep -E \
-            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_SYS_TEXT_BASE|CONFIG_ARCH_EXYNOS)' \
+            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_USB_HOST|CONFIG_USB_STORAGE|CONFIG_BOOTMETH_EXTLINUX|CONFIG_ENV_IS_NOWHERE)' \
             build/.config || true
 
           grep -q \
             '^CONFIG_DEFAULT_DEVICE_TREE="exynos/exynos850-a217f"$' \
             build/.config
+          grep -q '^CONFIG_USB_HOST=y$' build/.config
+          grep -q '^CONFIG_USB_STORAGE=y$' build/.config
+          grep -q '^CONFIG_BOOTMETH_EXTLINUX=y$' build/.config
+          grep -q '^CONFIG_ENV_IS_NOWHERE=y$' build/.config
+          ! grep -q '^CONFIG_ENV_IS_IN_MMC=y$' build/.config
+          ! grep -q '^CONFIG_CMD_DFU=y$' build/.config
+          ! grep -q '^CONFIG_USB_FUNCTION_FASTBOOT=y$' build/.config
+          ! grep -q '^CONFIG_FASTBOOT_FLASH=y$' build/.config
 
       - name: Build U-Boot
         run: |
@@ -173,6 +201,9 @@ jobs:
             echo "Device: Samsung Galaxy A21s SM-A217F"
             echo "SoC: Exynos 850"
             echo "RAM variant: 3 GB"
+            echo "Autoboot: USB extlinux first, then all available MMC devices"
+            echo "U-Boot environment: RAM-only; no eMMC save"
+            echo "Interactive buttons: not required for autoboot"
             echo "Build is experimental; not verified for flashing."
             echo "Date (UTC): $(date -u +%FT%TZ)"
             echo

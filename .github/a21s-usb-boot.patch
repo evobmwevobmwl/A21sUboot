@@ -1,0 +1,7 @@
+diff --git a/board/samsung/e850-96/e850-96.env b/board/samsung/e850-96/e850-96.env
+--- a/board/samsung/e850-96/e850-96.env
++++ b/board/samsung/e850-96/e850-96.env
+@@ -8 +8,3 @@
+ fdtfile=exynos/exynos850-a217f.dtb
++boot_targets=usb0 mmc
++bootcmd=usb start; bootflow scan -lb
