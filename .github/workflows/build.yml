@@ -80,25 +80,74 @@ jobs:
           git -C source log -1 --format='%s' \
             | tee source-description.txt
 
-      - name: Configure automatic USB-first boot with MMC fallback
+      - name: Configure A21s USB host, timer, and automatic boot
         run: |
           set -eu
 
           env_file=source/board/samsung/e850-96/e850-96.env
           test -f "$env_file"
 
-          if grep -q '^boot_targets=' "$env_file"; then
-            echo "::error::Upstream already defines boot_targets."
+          if grep -qE '^(boot_targets|bootdelay)=' "$env_file"; then
+            echo "::error::Upstream already defines boot_targets or bootdelay."
             exit 1
           fi
 
-          # The unnumbered "usb" label scans all USB mass-storage devices;
-          # bootflow's USB hunter initializes the host controller itself.
+          # Scan USB mass storage before MMC and skip the non-responsive prompt.
           cat >> "$env_file" <<'EOF'
           boot_targets=usb mmc
+          bootdelay=0
           EOF
 
-          grep -n '^boot_targets=' "$env_file"
+          grep -nE '^boot_(targets|delay)=' "$env_file"
+
+          python3 - <<'PYCODE'
+          from pathlib import Path
+
+          dts = Path('source/dts/upstream/src/arm64/exynos/exynos850-a217f.dts')
+          text = dts.read_text()
+          old = '&usbdrd_dwc3 {\n\tdr_mode = "otg";'
+          new = '&usbdrd_dwc3 {\n\tdr_mode = "host";'
+          if text.count(old) != 1:
+              raise SystemExit('Expected exactly one A21s DWC3 OTG mode stanza')
+          dts.write_text(text.replace(old, new))
+          print(f'Forced U-Boot USB controller to host mode in {dts}')
+
+          timer = Path('source/arch/arm/cpu/armv8/generic_timer.c')
+          text = timer.read_text()
+          old = "\n".join([
+              "unsigned long notrace get_tbclk(void)",
+              "{",
+              "\tunsigned long cntfrq;",
+              "",
+              "\tif (IS_ENABLED(CONFIG_ARMV8_CNTFRQ_BROKEN) && gd->arch.timer_rate_hz)",
+              "\t\treturn gd->arch.timer_rate_hz;",
+              "",
+              "\tasm volatile(\"mrs %0, cntfrq_el0\" : \"=r\" (cntfrq));",
+              "\treturn cntfrq;",
+              "}",
+          ])
+          new = "\n".join([
+              "unsigned long notrace get_tbclk(void)",
+              "{",
+              "\tif (IS_ENABLED(CONFIG_ARMV8_CNTFRQ_BROKEN) && gd->arch.timer_rate_hz)",
+              "\t\treturn gd->arch.timer_rate_hz;",
+              "",
+              "#if CONFIG_COUNTER_FREQUENCY",
+              "\t/* A21s firmware may leave CNTFRQ_EL0 unset; use the board value. */",
+              "\treturn CONFIG_COUNTER_FREQUENCY;",
+              "#else",
+              "\tunsigned long cntfrq;",
+              "",
+              "\tasm volatile(\"mrs %0, cntfrq_el0\" : \"=r\" (cntfrq));",
+              "\treturn cntfrq;",
+              "#endif",
+              "}",
+          ])
+          if text.count(old) != 1:
+              raise SystemExit('Could not uniquely locate ARM generic timer function')
+          timer.write_text(text.replace(old, new))
+          print(f'Added configured counter-frequency fallback in {timer}')
+          PYCODE
 
       - name: Inspect Galaxy A21s support
         run: |
@@ -129,6 +178,9 @@ jobs:
           make O=build e850-96_defconfig
 
           scripts/config --file build/.config \
+            --set-val COUNTER_FREQUENCY 26000000
+
+          scripts/config --file build/.config \
             --disable ENV_IS_IN_MMC \
             --disable CMD_DFU \
             --disable USB_FUNCTION_FASTBOOT \
@@ -139,7 +191,7 @@ jobs:
 
           echo "=== Selected configuration ==="
           grep -E \
-            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_USB_HOST|CONFIG_USB_STORAGE|CONFIG_BOOTMETH_EXTLINUX|CONFIG_ENV_IS_NOWHERE)' \
+            '^(CONFIG_DEFAULT_DEVICE_TREE|CONFIG_COUNTER_FREQUENCY|CONFIG_USB_HOST|CONFIG_USB_STORAGE|CONFIG_USB_XHCI_HCD|CONFIG_USB_XHCI_DWC3|CONFIG_USB_DWC3_GENERIC|CONFIG_PHY_EXYNOS_USBDRD|CONFIG_BOOTMETH_EXTLINUX|CONFIG_ENV_IS_NOWHERE)' \
             build/.config || true
 
           grep -q \
@@ -147,6 +199,11 @@ jobs:
             build/.config
           grep -q '^CONFIG_USB_HOST=y$' build/.config
           grep -q '^CONFIG_USB_STORAGE=y$' build/.config
+          grep -q '^CONFIG_USB_XHCI_HCD=y$' build/.config
+          grep -q '^CONFIG_USB_XHCI_DWC3=y$' build/.config
+          grep -q '^CONFIG_USB_DWC3_GENERIC=y$' build/.config
+          grep -q '^CONFIG_PHY_EXYNOS_USBDRD=y$' build/.config
+          grep -q '^CONFIG_COUNTER_FREQUENCY=26000000$' build/.config
           grep -q '^CONFIG_BOOTMETH_EXTLINUX=y$' build/.config
           grep -q '^CONFIG_ENV_IS_NOWHERE=y$' build/.config
           grep -q '^CONFIG_BOOTCOMMAND="bootflow scan -lb"$' build/.config
@@ -167,9 +224,14 @@ jobs:
 
           echo "=== Verify embedded autoboot defaults ==="
           strings build/u-boot.bin | grep -Fx 'boot_targets=usb mmc'
+          strings build/u-boot.bin | grep -Fx 'bootdelay=0'
           strings build/u-boot.bin | grep -Fx 'bootcmd=bootflow scan -lb'
-          ! strings build/u-boot.bin | \
-            grep -Fx 'bootcmd=usb start; bootflow scan -lb'
+
+          echo "=== Verify compiled A21s USB host mode ==="
+          dtb=$(find build -type f -name u-boot.dtb -print -quit)
+          test -n "$dtb"
+          test "$(fdtget -t s "$dtb" /usb@13600000/usb@0 dr_mode)" = host
+          fdtget -t s "$dtb" /usb@13600000/usb@0 dr_mode
 
           echo "=== Build outputs ==="
           find build -type f \
@@ -217,7 +279,9 @@ jobs:
             echo "Device: Samsung Galaxy A21s SM-A217F"
             echo "SoC: Exynos 850"
             echo "RAM variant: 3 GB"
-            echo "Autoboot: automatic scan of all USB storage first, then all available MMC devices"
+            echo "Autoboot: automatic scan of USB mass storage first, then MMC"
+            echo "USB controller: forced host mode for A21s OTG port"
+            echo "System counter: 26000000 Hz fallback for Samsung boot firmware"
             echo "U-Boot environment: RAM-only; no eMMC save"
             echo "Interactive buttons: not required for autoboot"
             echo "Build is experimental; not verified for flashing."
