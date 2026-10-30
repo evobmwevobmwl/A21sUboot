@@ -237,6 +237,7 @@ jobs:
           echo "=== Verify embedded autoboot defaults ==="
           strings build/u-boot.bin | grep -Fx 'boot_targets=usb mmc'
           strings build/u-boot.bin | grep -Fx 'bootdelay=5'
+          strings build/u-boot.bin | grep -Fx 'A21s OTG: I2C0 clock enabled'
           strings build/u-boot.bin | grep -F 'A21s OTG: S2MU106 PLUG_MON2=0x%02x'
           strings build/u-boot.bin | grep -Fx 'A21s OTG: source role confirmed; S2MU106 VBUS boost enabled'
           strings build/u-boot.bin | grep -Fx 'bootcmd=bootflow scan -lb'

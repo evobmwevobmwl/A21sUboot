@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+
 /* A21s-specific S2MU106 OTG source detection and VBUS enable. */
 
+#include <clk.h>
+#include <dm/uclass.h>
 #include <i2c.h>
 #include <stdio.h>
 
@@ -12,8 +14,30 @@
 
 void a21s_usb_vbus_if_host_attached(void)
 {
-	struct udevice *pdic, *charger;
+	struct udevice *i2c_bus, *pdic, *charger;
+	struct clk i2c_clk;
 	int plug_state, ctrl3, ctrl0, ret;
+
+	ret = uclass_get_device_by_seq(UCLASS_I2C, 0, &i2c_bus);
+	if (ret) {
+		printf("A21s OTG: I2C0 lookup failed (%d); VBUS stays off\n", ret);
+		return;
+	}
+
+	ret = clk_get_by_name(i2c_bus, "i2c", &i2c_clk);
+	if (ret) {
+		printf("A21s OTG: I2C0 clock lookup failed (%d); VBUS stays off\n",
+		       ret);
+		return;
+	}
+
+	ret = clk_enable(&i2c_clk);
+	if (ret) {
+		printf("A21s OTG: I2C0 clock enable failed (%d); VBUS stays off\n",
+		       ret);
+		return;
+	}
+	printf("A21s OTG: I2C0 clock enabled\n");
 
 	ret = i2c_get_chip_for_busnum(0, A21S_S2MU106_PDIC_ADDR, 1, &pdic);
 	if (ret) {
