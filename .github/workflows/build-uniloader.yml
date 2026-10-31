@@ -1,10 +1,10 @@
-name: Build A21s uniLoader
+name: Build A21s Alpine image through uniLoader
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_run_id:
-        description: Successful A21s Linux workflow run containing Image and DTB
+      alpine_run_id:
+        description: Successful run containing alpine-aarch64-rootfs
         required: true
         default: '40764327953'
         type: string
@@ -17,19 +17,22 @@ permissions:
   contents: read
 
 concurrency:
-  group: a21s-uniloader-${{ github.ref }}
+  group: a21s-alpine-uniloader-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build uniLoader for SM-A217F
+    name: Build SM-A217F mainline kernel and Alpine boot image
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
-      KERNEL_RUN_ID: ${{ github.event.inputs.kernel_run_id || '40764327953' }}
+      KERNEL_COMMIT: cad9d83aeb26da2df00b435f6c11b6e113dd4345
+      UNILOADER_COMMIT: 06a1bba90f6f00f4a3f745eb072c54e2190c0832
+      MKBOOTIMG_COMMIT: d3e0acd56e80dba7cfa5b9240d731c7bf00045bd
+      ALPINE_RUN_ID: ${{ inputs.alpine_run_id || '40764327953' }}
 
     steps:
-      - name: Checkout workflow repository
+      - name: Checkout A21sUboot
         uses: actions/checkout@v4
 
       - name: Install build dependencies
@@ -42,6 +45,7 @@ jobs:
             build-essential \
             cpio \
             device-tree-compiler \
+            dwarves \
             flex \
             gcc-aarch64-linux-gnu \
             gzip \
@@ -49,79 +53,353 @@ jobs:
             libncurses-dev \
             libssl-dev \
             python3 \
-            python3-setuptools \
             rsync
 
-      - name: Fetch uniLoader source
+      - name: Fetch pinned A21s mainline kernel source
         run: |
-          set -eu
+          set -euxo pipefail
+          git init linux
+          git -C linux remote add origin https://github.com/samsungexynos850/linux.git
+          git -C linux fetch --depth=1 origin "$KERNEL_COMMIT"
+          git -C linux checkout --detach FETCH_HEAD
+          git -C linux rev-parse HEAD | tee kernel-commit.txt
+          test -f linux/arch/arm64/configs/fragments/exynos850-a217f.config
+          test -f linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dts
+          test "$(make -s -C linux ARCH=arm64 kernelversion)" = "7.3.0"
 
-          git init uniloader
-          git -C uniloader remote add origin \
-            https://github.com/samsungexynos850/uniLoader.git
-          git -C uniloader fetch --depth=1 origin \
-            06a1bba90f6f00f4a3f745eb072c54e2190c0832
-          git -C uniloader checkout --detach FETCH_HEAD
-          git -C uniloader rev-parse HEAD | tee uniloader-commit.txt
-
-          test -f uniloader/configs/a21s_defconfig
-
-      - name: Download successful A21s kernel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: a21s-linux-kernel
-          path: kernel-artifact
-          repository: ${{ github.repository }}
-          run-id: ${{ env.KERNEL_RUN_ID }}
-          github-token: ${{ github.token }}
-
-      - name: Stage kernel and A21s DTB blobs
+      - name: Configure compact A21s kernel with USB host and F2FS
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          cd linux
 
-          image="$(find kernel-artifact -type f -name Image -print -quit)"
-          dtb="$(find kernel-artifact -type f \
-            -name exynos850-a217f.dtb -print -quit)"
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          scripts/kconfig/merge_config.sh -m .config \
+            arch/arm64/configs/fragments/exynos850-a217f.config
 
-          if [ -z "$image" ] || [ -z "$dtb" ]; then
-            echo "::error::Kernel artifact is missing A21s Image or DTB."
-            find kernel-artifact -maxdepth 4 -type f -print | sort
+          scripts/config --disable CONFIG_USB_DWC3_HOST
+          scripts/config --disable CONFIG_USB_DWC3_GADGET
+          scripts/config --enable CONFIG_USB_DWC3_DUAL_ROLE
+          scripts/config --enable CONFIG_USB_ROLE_SWITCH
+          scripts/config --enable CONFIG_USB_DWC3
+          scripts/config --enable CONFIG_USB_DWC3_EXYNOS
+          scripts/config --enable CONFIG_USB_XHCI_HCD
+          scripts/config --enable CONFIG_USB_XHCI_PLATFORM
+          scripts/config --enable CONFIG_USB_STORAGE
+          scripts/config --enable CONFIG_SCSI
+          scripts/config --enable CONFIG_BLK_DEV_SD
+
+          scripts/config --enable CONFIG_MMC
+          scripts/config --enable CONFIG_MMC_BLOCK
+          scripts/config --enable CONFIG_MMC_DW
+          scripts/config --enable CONFIG_MMC_DW_EXYNOS
+
+          scripts/config --enable CONFIG_EXT4_FS
+          scripts/config --enable CONFIG_F2FS_FS
+          scripts/config --enable CONFIG_VFAT_FS
+          scripts/config --enable CONFIG_EXFAT_FS
+          scripts/config --enable CONFIG_NLS_CODEPAGE_437
+          scripts/config --enable CONFIG_NLS_ISO8859_1
+
+          scripts/config --enable CONFIG_BLK_DEV_INITRD
+          scripts/config --enable CONFIG_DEVTMPFS
+          scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          scripts/config --enable CONFIG_DRM_SIMPLEDRM
+          scripts/config --enable CONFIG_FRAMEBUFFER_CONSOLE
+          scripts/config --enable CONFIG_VT
+          scripts/config --enable CONFIG_VT_CONSOLE
+          scripts/config --set-str CONFIG_CMDLINE "console=tty0 loglevel=8 ignore_loglevel"
+          scripts/config --enable CONFIG_CMDLINE_FORCE
+
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+
+          cp .config "$GITHUB_WORKSPACE/kernel.config"
+          grep -E '^(CONFIG_(USB_DWC3_DUAL_ROLE|USB_ROLE_SWITCH|USB_DWC3_EXYNOS|USB_STORAGE|SCSI|BLK_DEV_SD|MMC_DW_EXYNOS|EXT4_FS|F2FS_FS|VFAT_FS|EXFAT_FS|DEVTMPFS|DEVTMPFS_MOUNT|FRAMEBUFFER_CONSOLE|CMDLINE_FORCE))=' \
+            .config | tee "$GITHUB_WORKSPACE/kernel-config-selected.txt"
+
+          for option in \
+            CONFIG_USB_DWC3_DUAL_ROLE \
+            CONFIG_USB_ROLE_SWITCH \
+            CONFIG_USB_DWC3_EXYNOS \
+            CONFIG_USB_STORAGE \
+            CONFIG_SCSI \
+            CONFIG_BLK_DEV_SD \
+            CONFIG_MMC_DW_EXYNOS \
+            CONFIG_EXT4_FS \
+            CONFIG_F2FS_FS \
+            CONFIG_VFAT_FS \
+            CONFIG_EXFAT_FS \
+            CONFIG_DEVTMPFS \
+            CONFIG_DEVTMPFS_MOUNT \
+            CONFIG_FRAMEBUFFER_CONSOLE \
+            CONFIG_CMDLINE_FORCE; do
+            grep -qx "$option=y" .config || {
+              echo "::error::$option was not enabled after olddefconfig"
+              exit 1
+            }
+          done
+
+          if grep -qx 'CONFIG_USB_DWC3_GADGET=y' .config; then
+            echo "::error::DWC3 remained gadget-only instead of dual-role."
             exit 1
           fi
 
-          mkdir -p uniloader/blob
-          cp "$image" uniloader/blob/Image
-          cp "$dtb" uniloader/blob/dtb
-
-          file uniloader/blob/Image uniloader/blob/dtb
-          sha256sum uniloader/blob/Image uniloader/blob/dtb
-
-          # uniLoader's A21s defconfig requires a ramdisk blob at link time.
-          # This empty initramfs only satisfies that build input; it is not
-          # Alpine rootfs and does not implement USB root discovery.
-          mkdir -p "$RUNNER_TEMP/empty-initramfs/dev" \
-            "$RUNNER_TEMP/empty-initramfs/root"
-          (
-            cd "$RUNNER_TEMP/empty-initramfs"
-            find . -print0 \
-              | LC_ALL=C sort -z \
-              | cpio --null --create --format=newc \
-                  --owner=0:0 --quiet
-          ) | gzip -n -9 > uniloader/blob/ramdisk
-
-          file uniloader/blob/ramdisk
-          sha256sum uniloader/blob/ramdisk
-
-          if [ -f kernel-artifact/kernel-commit.txt ]; then
-            cp kernel-artifact/kernel-commit.txt .
-          elif [ -f kernel-artifact/kernel/kernel-commit.txt ]; then
-            cp kernel-artifact/kernel/kernel-commit.txt .
-          fi
-
-      - name: Configure uniLoader A21s target
+      - name: Build A21s kernel and device tree
         run: |
           set -euxo pipefail
+          make -C linux -j2 \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image dtbs
 
+          test -s linux/arch/arm64/boot/Image
+          test -s linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb
+          file linux/arch/arm64/boot/Image \
+            linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb
+          sha256sum linux/arch/arm64/boot/Image \
+            linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb
+
+      - name: Download Alpine ARM64 rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: alpine-aarch64-rootfs
+          path: alpine-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ env.ALPINE_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Stage kernel and create Alpine eMMC/USB initramfs
+        run: |
+          set -euo pipefail
+
+          rootfs_tar="$(find alpine-artifact -type f \
+            \( -name alpine-minirootfs.tar.gz -o -name rootfs.tar.gz \) \
+            -print -quit)"
+          if [ -z "$rootfs_tar" ]; then
+            echo "::error::Alpine ARM64 rootfs tarball was not found."
+            find alpine-artifact -maxdepth 4 -type f -print | sort
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/alpine-initramfs"
+          alpine="$RUNNER_TEMP/alpine-rootfs"
+          mkdir -p "$work"/{bin,lib,dev,proc,sys,mnt,run,newroot,newroot-bind}
+          mkdir -p "$alpine"
+          tar -xzf "$rootfs_tar" -C "$alpine"
+
+          test -x "$alpine/bin/busybox"
+          test -e "$alpine/lib/ld-musl-aarch64.so.1"
+          test -e "$alpine/lib/libc.musl-aarch64.so.1"
+          cp -a "$alpine/bin/busybox" "$work/bin/busybox"
+          cp -a "$alpine/lib/ld-musl-aarch64.so.1" "$work/lib/"
+          cp -a "$alpine/lib/libc.musl-aarch64.so.1" "$work/lib/"
+
+          cat > "$work/init" <<'INIT'
+          #!/bin/busybox sh
+
+          PATH=/bin:/sbin
+          export PATH
+
+          /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+          /bin/busybox mount -t proc proc /proc 2>/dev/null || true
+          /bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+          /bin/busybox mkdir -p /mnt/source /newroot /newroot-bind /run
+          echo '[A21s] Linux initramfs started; scanning eMMC, SD and USB storage' >/dev/console
+
+          is_emmc() {
+            block="$(/bin/busybox basename "$1")"
+            case "$block" in
+              mmcblk*p[0-9]*) parent="$(printf '%s' "$block" | /bin/busybox sed 's/p[0-9]*$//')" ;;
+              mmcblk[0-9]*) parent="$block" ;;
+              *) return 1 ;;
+            esac
+            type="$(/bin/busybox cat "/sys/class/block/$parent/device/type" 2>/dev/null)"
+            [ "$type" = "MMC" ] || [ "$parent" = "mmcblk0" ]
+          }
+
+          finish_root() {
+            rootdir="$1"
+            /bin/busybox mkdir -p "$rootdir/dev" "$rootdir/proc" \
+              "$rootdir/sys" "$rootdir/run"
+            echo '[A21s] Starting Alpine /sbin/init' >/dev/console
+            /bin/busybox mount --move /dev "$rootdir/dev" 2>/dev/null || true
+            /bin/busybox mount --move /proc "$rootdir/proc" 2>/dev/null || true
+            /bin/busybox mount --move /sys "$rootdir/sys" 2>/dev/null || true
+            /bin/busybox switch_root "$rootdir" /sbin/init
+            echo '[A21s] switch_root failed; dropping to initramfs shell' >/dev/console
+            exec /bin/busybox sh
+          }
+
+          copy_root_to_ram() {
+            source_root="$1"
+            /bin/busybox mount -t tmpfs -o size=768M alpine-root /newroot || return 1
+            if ! /bin/busybox tar -C "$source_root" -cpf - . \
+                | /bin/busybox tar -C /newroot -xpf -; then
+              /bin/busybox umount /newroot
+              return 1
+            fi
+            /bin/busybox umount /mnt/source 2>/dev/null || true
+            finish_root /newroot
+          }
+
+          switch_from_storage() {
+            source_root="$1"
+            source_dev="$2"
+            if is_emmc "$source_dev"; then
+              echo "[A21s] Alpine directory found on internal eMMC ($source_dev); copying to RAM" >/dev/console
+              copy_root_to_ram "$source_root"
+              return $?
+            fi
+
+            /bin/busybox mount -o remount,rw /mnt/source 2>/dev/null || true
+            if [ "$source_root" = /mnt/source ]; then
+              finish_root /mnt/source
+            fi
+            /bin/busybox mount --bind "$source_root" /newroot-bind || return 1
+            finish_root /newroot-bind
+          }
+
+          boot_from_archive() {
+            archive="$1"
+            echo "[A21s] Extracting Alpine archive: $archive" >/dev/console
+            /bin/busybox mount -t tmpfs -o size=768M alpine-root /newroot || return 1
+            if ! /bin/busybox tar -xzf "$archive" -C /newroot; then
+              /bin/busybox umount /newroot
+              return 1
+            fi
+            /bin/busybox umount /mnt/source 2>/dev/null || true
+
+            if [ -x /newroot/sbin/init ]; then
+              finish_root /newroot
+            fi
+            if [ -x /newroot/alpine/sbin/init ]; then
+              /bin/busybox mount --bind /newroot/alpine /newroot-bind || return 1
+              finish_root /newroot-bind
+            fi
+            if [ -x /newroot/rootfs/sbin/init ]; then
+              /bin/busybox mount --bind /newroot/rootfs /newroot-bind || return 1
+              finish_root /newroot-bind
+            fi
+
+            echo '[A21s] Archive has no Alpine /sbin/init' >/dev/console
+            /bin/busybox umount /newroot
+            return 1
+          }
+
+          find_archive() {
+            search_root="$1"
+            archive=""
+            for path in \
+              "$search_root/rootfs.tar.gz" \
+              "$search_root/alpine-minirootfs.tar.gz" \
+              "$search_root/alpine-rootfs.tar.gz" \
+              "$search_root/local/rootfs.tar.gz" \
+              "$search_root/local/tmp/rootfs.tar.gz" \
+              "$search_root/local/alpine/rootfs.tar.gz" \
+              "$search_root/media/0/Download/rootfs.tar.gz"; do
+              if [ -f "$path" ]; then
+                archive="$path"
+                break
+              fi
+            done
+
+            if [ -z "$archive" ] && [ -d "$search_root/local" ]; then
+              archive="$(/bin/busybox find "$search_root/local" -maxdepth 5 \
+                -type f \( -iname 'rootfs.tar.gz' \
+                -o -iname 'alpine-minirootfs*.tar.gz' \
+                -o -iname 'alpine-rootfs*.tar.gz' \) -print -quit 2>/dev/null)"
+            fi
+            if [ -z "$archive" ] && [ -d "$search_root/media/0/Download" ]; then
+              archive="$(/bin/busybox find "$search_root/media/0/Download" \
+                -maxdepth 3 -type f \( -iname 'rootfs.tar.gz' \
+                -o -iname 'alpine-minirootfs*.tar.gz' \
+                -o -iname 'alpine-rootfs*.tar.gz' \) -print -quit 2>/dev/null)"
+            fi
+            if [ -z "$archive" ] && ! is_emmc "$current_dev"; then
+              archive="$(/bin/busybox find "$search_root" -maxdepth 4 \
+                -type f \( -iname 'rootfs.tar.gz' \
+                -o -iname 'alpine-minirootfs*.tar.gz' \
+                -o -iname 'alpine-rootfs*.tar.gz' \) -print -quit 2>/dev/null)"
+            fi
+            printf '%s' "$archive"
+          }
+
+          attempt=0
+          while [ "$attempt" -lt 20 ]; do
+            for dev in /dev/mmcblk[0-9] /dev/mmcblk[0-9]p* \
+                       /dev/sd[a-z] /dev/sd[a-z][0-9]*; do
+              [ -b "$dev" ] || continue
+
+              for fs in ext4 f2fs vfat exfat; do
+                case "$fs" in
+                  ext4) opts=ro,noload ;;
+                  f2fs) opts=ro,norecovery ;;
+                  *) opts=ro ;;
+                esac
+
+                if ! /bin/busybox mount -t "$fs" -o "$opts" \
+                    "$dev" /mnt/source 2>/dev/null; then
+                  continue
+                fi
+
+                for candidate in \
+                  /mnt/source \
+                  /mnt/source/alpine \
+                  /mnt/source/rootfs \
+                  /mnt/source/local/alpine \
+                  /mnt/source/data/local/alpine; do
+                  if [ -x "$candidate/sbin/init" ]; then
+                    echo "[A21s] Found Alpine on $dev ($fs)" >/dev/console
+                    switch_from_storage "$candidate" "$dev"
+                  fi
+                done
+
+                current_dev="$dev"
+                archive="$(find_archive /mnt/source)"
+                if [ -n "$archive" ]; then
+                  echo "[A21s] Found rootfs archive on $dev ($fs)" >/dev/console
+                  boot_from_archive "$archive"
+                fi
+
+                /bin/busybox umount /mnt/source
+              done
+            done
+            attempt=$((attempt + 1))
+            /bin/busybox sleep 1
+          done
+
+          echo '[A21s] Alpine not found. Check that the rootfs is extracted or rootfs.tar.gz is present.' >/dev/console
+          echo '[A21s] Emergency shell: inspect /dev, /sys/class/block and mount manually.' >/dev/console
+          exec /bin/busybox sh
+          INIT
+          chmod 0755 "$work/init"
+
+          (
+            cd "$work"
+            find . -print0 | LC_ALL=C sort -z \
+              | cpio --null --create --format=newc --owner=0:0 --quiet
+          ) | gzip -n -9 > uniloader/blob/ramdisk
+
+          cp linux/arch/arm64/boot/Image uniloader/blob/Image
+          cp linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb \
+            uniloader/blob/dtb
+          file uniloader/blob/Image uniloader/blob/dtb uniloader/blob/ramdisk
+          sha256sum uniloader/blob/Image uniloader/blob/dtb \
+            uniloader/blob/ramdisk
+
+      - name: Fetch pinned uniLoader source
+        run: |
+          set -euxo pipefail
+          git init uniloader
+          git -C uniloader remote add origin \
+            https://github.com/samsungexynos850/uniLoader.git
+          git -C uniloader fetch --depth=1 origin "$UNILOADER_COMMIT"
+          git -C uniloader checkout --detach FETCH_HEAD
+          git -C uniloader rev-parse HEAD | tee uniloader-commit.txt
+          test -f uniloader/configs/a21s_defconfig
+
+      - name: Configure and build uniLoader for A21s
+        run: |
+          set -euxo pipefail
           build_dir="$RUNNER_TEMP/uniloader-build"
           mkdir -p "$build_dir"
 
@@ -130,66 +408,108 @@ jobs:
             ARCH=aarch64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             a21s_defconfig
-
-          echo "=== Selected uniLoader paths ==="
-          grep -E \
-            '^(CONFIG_(KERNEL_PATH|DT_PATH|RAMDISK_PATH|TEXT_BASE|CROSS_COMPILE))=' \
-            "$build_dir/.config" || true
-
           cp "$build_dir/.config" uniloader.config
 
-      - name: Build uniLoader
-        run: |
-          set -euxo pipefail
-
           make -C uniloader \
-            O="$RUNNER_TEMP/uniloader-build" \
+            O="$build_dir" \
             ARCH=aarch64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$(nproc)"
 
-      - name: Collect build outputs and metadata
+          test -s "$build_dir/uniLoader"
+          file "$build_dir/uniLoader"
+          stat -c 'uniLoader raw size: %s bytes' "$build_dir/uniLoader"
+
+      - name: Fetch pinned AOSP mkbootimg and package Android Boot v2
+        run: |
+          set -euxo pipefail
+          git init mkbootimg
+          git -C mkbootimg remote add origin \
+            https://android.googlesource.com/platform/system/tools/mkbootimg
+          git -C mkbootimg fetch --depth=1 origin "$MKBOOTIMG_COMMIT"
+          git -C mkbootimg checkout --detach FETCH_HEAD
+
+          mkdir -p artifacts
+          python3 mkbootimg/mkbootimg.py \
+            --kernel "$RUNNER_TEMP/uniloader-build/uniLoader" \
+            --dtb linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb \
+            --header_version 2 \
+            --pagesize 2048 \
+            --base 0x10000000 \
+            --kernel_offset 0x70080000 \
+            --ramdisk_offset 0x01000000 \
+            --second_offset 0x00f00000 \
+            --tags_offset 0x100 \
+            --dtb_offset 0x01f00000 \
+            --board exynos850 \
+            --output artifacts/boot-uniloader-a21s-alpine.img
+
+          file artifacts/boot-uniloader-a21s-alpine.img
+          python3 - <<'PY'
+          import pathlib
+          import struct
+
+          image = pathlib.Path("artifacts/boot-uniloader-a21s-alpine.img")
+          data = image.read_bytes()
+          assert data[:8] == b"ANDROID!"
+          kernel_size, kernel_addr = struct.unpack_from("<II", data, 8)
+          ramdisk_size, ramdisk_addr = struct.unpack_from("<II", data, 16)
+          second_size, second_addr = struct.unpack_from("<II", data, 24)
+          tags_addr, page_size, header_version = struct.unpack_from("<III", data, 32)
+          assert kernel_size > 0
+          assert kernel_addr == 0x80080000
+          assert page_size == 2048
+          assert header_version == 2
+          assert ramdisk_size == 0
+          assert second_size == 0
+          assert image.stat().st_size <= 36 * 1024 * 1024
+          dtb_size = struct.unpack_from("<I", data, 1648)[0]
+          dtb_addr = struct.unpack_from("<Q", data, 1652)[0]
+          assert dtb_size > 0
+          assert dtb_addr == 0x11F00000
+          print(f"Android boot v{header_version}; kernel={kernel_size} bytes; "
+                f"addr=0x{kernel_addr:08x}; dtb={dtb_size} bytes at {dtb_addr:#x}")
+          print(f"ramdisk_addr=0x{ramdisk_addr:08x}; tags_addr=0x{tags_addr:08x}; "
+                f"page_size={page_size}; image={image.stat().st_size} bytes")
+          PY
+
+      - name: Collect flashable Boot image and build metadata
         if: always()
         run: |
           mkdir -p artifacts
 
-          if [ -d "$RUNNER_TEMP/uniloader-build" ]; then
-            cp "$RUNNER_TEMP/uniloader-build/.config" \
-              artifacts/uniloader.config 2>/dev/null || true
-            find "$RUNNER_TEMP/uniloader-build" -type f \
-              \( -name '*.bin' -o -name '*.elf' -o -name '*.img' \
-              -o -name '*.itb' \) \
-              -exec cp --parents {} artifacts/ \; || true
-            find "$RUNNER_TEMP/uniloader-build" -type f -printf '%p %s bytes\n' \
-              | sort > artifacts/build-file-list.txt
-            tar -C "$RUNNER_TEMP/uniloader-build" \
-              -czf artifacts/uniloader-build-tree.tar.gz . || true
-          fi
-
-          cp uniloader-commit.txt artifacts/ 2>/dev/null || true
-          cp kernel-commit.txt artifacts/ 2>/dev/null || true
-          cp uniloader/blob/Image artifacts/ 2>/dev/null || true
-          cp uniloader/blob/dtb artifacts/ 2>/dev/null || true
-          cp uniloader/blob/ramdisk artifacts/ 2>/dev/null || true
+          [ ! -f kernel-commit.txt ] || cp kernel-commit.txt artifacts/
+          [ ! -f uniloader-commit.txt ] || cp uniloader-commit.txt artifacts/
+          [ ! -f kernel.config ] || cp kernel.config artifacts/
+          [ ! -f kernel-config-selected.txt ] || cp kernel-config-selected.txt artifacts/
+          [ ! -f uniloader.config ] || cp uniloader.config artifacts/
+          [ ! -f uniloader/blob/dtb ] || cp uniloader/blob/dtb artifacts/exynos850-a217f.dtb
+          [ ! -f uniloader/blob/ramdisk ] || cp uniloader/blob/ramdisk artifacts/initramfs.cpio.gz
 
           {
-            echo "Target: Samsung Galaxy A21s SM-A217F"
-            echo "Architecture: ARM64"
-            echo "uniLoader source: samsungexynos850/uniLoader"
-            echo "Configuration: a21s_defconfig"
-            echo "Kernel source artifact run: $KERNEL_RUN_ID"
-            echo "Ramdisk: empty build placeholder; not an Alpine rootfs"
-            echo "Build status is reported by this workflow run."
+            echo 'Target: Samsung Galaxy A21s SM-A217F, 3 GB RAM'
+            echo 'Path: Samsung Android Boot v2 -> uniLoader -> mainline Linux -> Alpine'
+            echo 'Kernel source commit:'
+            cat kernel-commit.txt 2>/dev/null || true
+            echo 'Kernel was built with A21s source config plus USB dual-role and F2FS.'
+            echo 'Kernel includes USB DWC3 dual-role, USB storage, F2FS, ext4, VFAT and exFAT.'
+            echo 'Initramfs scans eMMC, SD and USB block devices; rootfs archives are extracted to RAM.'
+            echo 'The image is a Boot-partition test image. It is not a Recovery image.'
+            echo 'Physical Linux/Alpine boot is not yet verified.'
             echo
-            echo "Collected outputs:"
             ls -lh artifacts/ || true
-          } > artifacts/build-info.txt
+          } > artifacts/README-BOOT-RU.txt
 
-      - name: Upload uniLoader build artifacts
+          if [ -f artifacts/boot-uniloader-a21s-alpine.img ]; then
+            sha256sum artifacts/boot-uniloader-a21s-alpine.img \
+              > artifacts/SHA256SUMS
+          fi
+
+      - name: Upload A21s uniLoader Boot image
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: a21s-uniloader
+          name: a21s-uniloader-alpine-boot
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
