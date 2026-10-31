@@ -217,7 +217,14 @@ jobs:
           aarch64-linux-gnu-gcc -Os -static -s \
             .github/patches/a21s-otg-init.c \
             -o "$work/bin/a21s-otg-init"
-          file "$work/bin/a21s-otg-init" "$work/lib/firmware/td4150_a21s.bin"
+          aarch64-linux-gnu-gcc -Os -static -s \
+            .github/patches/a21s-console-font.c \
+            -o "$work/bin/a21s-console-font"
+          aarch64-linux-gnu-gcc -Os -static -s \
+            .github/patches/a21s-touchkbd.c \
+            -o "$work/bin/a21s-touchkbd"
+          file "$work/bin/a21s-otg-init" "$work/bin/a21s-console-font" \
+            "$work/bin/a21s-touchkbd" "$work/lib/firmware/td4150_a21s.bin"
 
           test -x "$alpine/bin/busybox"
           test -e "$alpine/lib/ld-musl-aarch64.so.1"
@@ -236,6 +243,7 @@ jobs:
           /bin/busybox mount -t proc proc /proc 2>/dev/null || true
           /bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
           /bin/busybox mkdir -p /mnt/source /newroot /newroot-bind /run
+          /bin/a21s-console-font >/dev/console 2>&1 || true
           /bin/busybox sleep 1
           tries=0
           while [ ! -c /dev/i2c-0 ] && [ "$tries" -lt 5 ]; do
@@ -272,8 +280,39 @@ jobs:
             [ "$type" = "MMC" ] || [ "$parent" = "mmcblk0" ]
           }
 
+          prepare_alpine_console() {
+            target="$1"
+            /bin/busybox mkdir -p "$target/usr/sbin"
+            /bin/busybox cp /bin/a21s-touchkbd "$target/usr/sbin/a21s-touchkbd"
+            if [ -f "$target/etc/inittab" ]; then
+              if /bin/busybox grep -q '^tty1::respawn:' "$target/etc/inittab"; then
+                /bin/busybox sed -i \
+                  's#^tty1::respawn:.*#tty1::respawn:/bin/sh -l#' \
+                  "$target/etc/inittab"
+              else
+                echo 'tty1::respawn:/bin/sh -l' >> "$target/etc/inittab"
+              fi
+              if ! /bin/busybox grep -q 'a21s-touchkbd' "$target/etc/inittab"; then
+                echo '::respawn:/usr/sbin/a21s-touchkbd' >> "$target/etc/inittab"
+              fi
+            fi
+            echo '[A21s] Local root shell and touch keyboard enabled on tty1.' >/dev/console
+          }
+
+          emergency_console() {
+            /bin/a21s-touchkbd >/dev/console 2>&1 &
+            while :; do
+              /bin/busybox sh -c \
+                'exec </dev/tty1 >/dev/tty1 2>&1; exec /bin/busybox setsid -c /bin/busybox sh -i'
+              /bin/busybox sleep 1
+            done
+          }
+
           finish_root() {
             rootdir="$1"
+            if [ "$rootdir" = /newroot ]; then
+              prepare_alpine_console "$rootdir"
+            fi
             /bin/busybox mkdir -p "$rootdir/dev" "$rootdir/proc" \
               "$rootdir/sys" "$rootdir/run"
             echo '[A21s] Starting Alpine /sbin/init' >/dev/console
@@ -282,7 +321,7 @@ jobs:
             /bin/busybox mount --move /sys "$rootdir/sys" 2>/dev/null || true
             exec /bin/busybox switch_root "$rootdir" /sbin/init
             echo '[A21s] switch_root failed; dropping to initramfs shell' >/dev/console
-            exec /bin/busybox sh
+            emergency_console
           }
 
           copy_root_to_ram() {
@@ -438,7 +477,7 @@ jobs:
             name="$(/bin/busybox cat "$event/device/name" 2>/dev/null)"
             echo "  $(/bin/busybox basename "$event"): $name" >/dev/console
           done
-          exec /bin/busybox sh
+          emergency_console
           INIT
           chmod 0755 "$work/init"
 
@@ -686,6 +725,12 @@ jobs:
           aarch64-linux-gnu-gcc -Os -static -s \
             .github/patches/a21s-otg-init.c \
             -o "$root/bin/a21s-otg-init"
+          aarch64-linux-gnu-gcc -Os -static -s \
+            .github/patches/a21s-console-font.c \
+            -o "$root/bin/a21s-console-font"
+          aarch64-linux-gnu-gcc -Os -static -s \
+            .github/patches/a21s-touchkbd.c \
+            -o "$root/bin/a21s-touchkbd"
 
           python3 .github/patches/patch_a21s_initramfs.py "$root/init"
 
@@ -815,6 +860,10 @@ jobs:
             echo 'S2MU106 VBUS boost is enabled only if PDIC confirms source/DFP; OCP is limited to 1.2 A.'
             echo 'The charger is restored to its saved register state if the vendor setup sequence fails.'
             echo 'A21s touchscreen vddio uses the existing dummy regulator entry.'
+            echo 'The text console requests a 16x24 font; kernel and USB HID configuration are reused.'
+            echo 'Alpine archive is extracted into RAM; tty1 gets a local root shell and a TD4150 touch keyboard service.'
+            echo 'The touch keyboard draws in the lower 14 console rows and injects keys through uinput; screen alignment needs handset verification.'
+            echo 'USB power remains at nominal 5 V with the existing 1.2 A over-current limit.'
             echo 'This is a Boot-partition diagnostic image, not a Recovery image.'
             ls -lh artifacts/ || true
           } > artifacts/README-BOOT-RU.txt
