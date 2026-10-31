@@ -167,6 +167,9 @@ jobs:
           run-id: ${{ env.ALPINE_RUN_ID }}
           github-token: ${{ github.token }}
 
+      - name: Prepare uniLoader blob directory
+        run: mkdir -p uniloader/blob
+
       - name: Stage kernel and create Alpine eMMC/USB initramfs
         run: |
           set -euo pipefail
@@ -483,6 +486,7 @@ jobs:
           [ ! -f kernel.config ] || cp kernel.config artifacts/
           [ ! -f kernel-config-selected.txt ] || cp kernel-config-selected.txt artifacts/
           [ ! -f uniloader.config ] || cp uniloader.config artifacts/
+          [ ! -f linux/arch/arm64/boot/Image ] || cp linux/arch/arm64/boot/Image artifacts/Image
           [ ! -f uniloader/blob/dtb ] || cp uniloader/blob/dtb artifacts/exynos850-a217f.dtb
           [ ! -f uniloader/blob/ramdisk ] || cp uniloader/blob/ramdisk artifacts/initramfs.cpio.gz
 
