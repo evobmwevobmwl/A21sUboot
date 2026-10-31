@@ -220,11 +220,8 @@ jobs:
           aarch64-linux-gnu-gcc -Os -static -s \
             .github/patches/a21s-console-font.c \
             -o "$work/bin/a21s-console-font"
-          aarch64-linux-gnu-gcc -Os -static -s \
-            .github/patches/a21s-touchkbd.c \
-            -o "$work/bin/a21s-touchkbd"
           file "$work/bin/a21s-otg-init" "$work/bin/a21s-console-font" \
-            "$work/bin/a21s-touchkbd" "$work/lib/firmware/td4150_a21s.bin"
+            "$work/lib/firmware/td4150_a21s.bin"
 
           test -x "$alpine/bin/busybox"
           test -e "$alpine/lib/ld-musl-aarch64.so.1"
@@ -250,8 +247,16 @@ jobs:
             /bin/busybox sleep 1
             tries=$((tries + 1))
           done
-          /bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true
-          /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
+          otg_try=0
+          while [ "$otg_try" -lt 6 ]; do
+            /bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true
+            /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
+            if /bin/busybox grep -q 'VBUS boost enabled' /run/a21s-otg-status; then
+              break
+            fi
+            otg_try=$((otg_try + 1))
+            /bin/busybox sleep 1
+          done
           /bin/busybox sleep 2
           echo '[A21s] USB devices:' >/dev/console
           for usb in /sys/bus/usb/devices/*; do
@@ -282,25 +287,28 @@ jobs:
 
           prepare_alpine_console() {
             target="$1"
-            /bin/busybox mkdir -p "$target/usr/sbin"
-            /bin/busybox cp /bin/a21s-touchkbd "$target/usr/sbin/a21s-touchkbd"
             if [ -f "$target/etc/inittab" ]; then
+              if [ -x "$target/usr/local/sbin/a21s-phosh-session" ]; then
+                tty1_command='/usr/local/sbin/a21s-phosh-session'
+              else
+                tty1_command='/bin/sh -l'
+              fi
               if /bin/busybox grep -q '^tty1::respawn:' "$target/etc/inittab"; then
                 /bin/busybox sed -i \
-                  's#^tty1::respawn:.*#tty1::respawn:/bin/sh -l#' \
+                  "s#^tty1::respawn:.*#tty1::respawn:$tty1_command#" \
                   "$target/etc/inittab"
               else
-                echo 'tty1::respawn:/bin/sh -l' >> "$target/etc/inittab"
-              fi
-              if ! /bin/busybox grep -q 'a21s-touchkbd' "$target/etc/inittab"; then
-                echo '::respawn:/usr/sbin/a21s-touchkbd' >> "$target/etc/inittab"
+                echo "tty1::respawn:$tty1_command" >> "$target/etc/inittab"
               fi
             fi
-            echo '[A21s] Local root shell and touch keyboard enabled on tty1.' >/dev/console
+            if [ -x "$target/usr/local/sbin/a21s-phosh-session" ]; then
+              echo '[A21s] Starting Phosh on tty1; USB HID keyboard is enabled.' >/dev/console
+            else
+              echo '[A21s] Local root shell on tty1; USB HID keyboard input enabled.' >/dev/console
+            fi
           }
 
           emergency_console() {
-            /bin/a21s-touchkbd >/dev/console 2>&1 &
             while :; do
               /bin/busybox sh -c \
                 'exec </dev/tty1 >/dev/tty1 2>&1; exec /bin/busybox setsid -c /bin/busybox sh -i'
@@ -326,7 +334,7 @@ jobs:
 
           copy_root_to_ram() {
             source_root="$1"
-            /bin/busybox mount -t tmpfs -o size=768M alpine-root /newroot || return 1
+            /bin/busybox mount -t tmpfs -o size=1536M alpine-root /newroot || return 1
             if ! /bin/busybox tar -C "$source_root" -cpf - . \
                 | /bin/busybox tar -C /newroot -xpf -; then
               /bin/busybox umount /newroot
@@ -356,7 +364,7 @@ jobs:
           boot_from_archive() {
             archive="$1"
             echo "[A21s] Extracting Alpine archive: $archive" >/dev/console
-            /bin/busybox mount -t tmpfs -o size=768M alpine-root /newroot || return 1
+            /bin/busybox mount -t tmpfs -o size=1536M alpine-root /newroot || return 1
             if ! /bin/busybox tar -xzf "$archive" -C /newroot; then
               /bin/busybox umount /newroot
               return 1
@@ -384,6 +392,9 @@ jobs:
             search_root="$1"
             archive=""
             for path in \
+              "$search_root/rootfs-phosh.tar.gz" \
+              "$search_root/alpine-phosh-rootfs.tar.gz" \
+              "$search_root/phosh-rootfs.tar.gz" \
               "$search_root/rootfs.tar.gz" \
               "$search_root/alpine-minirootfs.tar.gz" \
               "$search_root/alpine-rootfs.tar.gz" \
@@ -399,19 +410,28 @@ jobs:
 
             if [ -z "$archive" ] && [ -d "$search_root/local" ]; then
               archive="$(/bin/busybox find "$search_root/local" -maxdepth 5 \
-                -type f \( -iname 'rootfs.tar.gz' \
+                -type f \( -iname 'rootfs-phosh*.tar.gz' \
+                -o -iname 'alpine-phosh*.tar.gz' \
+                -o -iname 'phosh-rootfs*.tar.gz' \
+                -o -iname 'rootfs.tar.gz' \
                 -o -iname 'alpine-minirootfs*.tar.gz' \
                 -o -iname 'alpine-rootfs*.tar.gz' \) -print -quit 2>/dev/null)"
             fi
             if [ -z "$archive" ] && [ -d "$search_root/media/0/Download" ]; then
               archive="$(/bin/busybox find "$search_root/media/0/Download" \
-                -maxdepth 3 -type f \( -iname 'rootfs.tar.gz' \
+                -maxdepth 3 -type f \( -iname 'rootfs-phosh*.tar.gz' \
+                -o -iname 'alpine-phosh*.tar.gz' \
+                -o -iname 'phosh-rootfs*.tar.gz' \
+                -o -iname 'rootfs.tar.gz' \
                 -o -iname 'alpine-minirootfs*.tar.gz' \
                 -o -iname 'alpine-rootfs*.tar.gz' \) -print -quit 2>/dev/null)"
             fi
             if [ -z "$archive" ] && ! is_emmc "$current_dev"; then
               archive="$(/bin/busybox find "$search_root" -maxdepth 4 \
-                -type f \( -iname 'rootfs.tar.gz' \
+                -type f \( -iname 'rootfs-phosh*.tar.gz' \
+                -o -iname 'alpine-phosh*.tar.gz' \
+                -o -iname 'phosh-rootfs*.tar.gz' \
+                -o -iname 'rootfs.tar.gz' \
                 -o -iname 'alpine-minirootfs*.tar.gz' \
                 -o -iname 'alpine-rootfs*.tar.gz' \) -print -quit 2>/dev/null)"
             fi
@@ -728,10 +748,6 @@ jobs:
           aarch64-linux-gnu-gcc -Os -static -s \
             .github/patches/a21s-console-font.c \
             -o "$root/bin/a21s-console-font"
-          aarch64-linux-gnu-gcc -Os -static -s \
-            .github/patches/a21s-touchkbd.c \
-            -o "$root/bin/a21s-touchkbd"
-
           python3 .github/patches/patch_a21s_initramfs.py "$root/init"
 
           (
@@ -861,8 +877,8 @@ jobs:
             echo 'The charger is restored to its saved register state if the vendor setup sequence fails.'
             echo 'A21s touchscreen vddio uses the existing dummy regulator entry.'
             echo 'The text console requests a 16x24 font; kernel and USB HID configuration are reused.'
-            echo 'Alpine archive is extracted into RAM; tty1 gets a local root shell and a TD4150 touch keyboard service.'
-            echo 'The touch keyboard draws in the lower 14 console rows and injects keys through uinput; screen alignment needs handset verification.'
+            echo 'Alpine archive is extracted into RAM; tty1 gets a local root shell for a physical USB HID keyboard.'
+            echo 'OTG VBUS is retried only while the PDIC confirms source/DFP; connect the USB keyboard before boot.'
             echo 'USB power remains at nominal 5 V with the existing 1.2 A over-current limit.'
             echo 'This is a Boot-partition diagnostic image, not a Recovery image.'
             ls -lh artifacts/ || true
@@ -878,4 +894,102 @@ jobs:
           name: a21s-uniloader-alpine-otg-enabled
           path: artifacts/
           if-no-files-found: warn
+          retention-days: 14
+
+  phosh-rootfs:
+    name: Prepare Alpine ARM64 rootfs with Phosh
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.alpine_run_id != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout A21sUboot
+        uses: actions/checkout@v4
+
+      - name: Download the official Alpine ARM64 minirootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: alpine-aarch64-rootfs
+          path: alpine-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.alpine_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Enable ARM64 package installation under QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Install Phosh and configure an automatic TTY1 session
+        run: |
+          set -euxo pipefail
+          rootfs_tar="$(find alpine-artifact -type f \
+            \( -name alpine-minirootfs.tar.gz -o -name rootfs.tar.gz \) \
+            -print -quit)"
+          test -n "$rootfs_tar"
+          rootfs="$RUNNER_TEMP/alpine-phosh-rootfs"
+          sudo mkdir -p "$rootfs"
+          sudo tar -xzf "$rootfs_tar" -C "$rootfs"
+
+          docker run --rm --platform linux/arm64 \
+            -v "$rootfs:/target" alpine:3.24 sh -euxc '
+              apk --root /target --no-cache add \
+                phosh phosh-portalsconf \
+                dbus-openrc dbus-x11 \
+                elogind elogind-openrc \
+                eudev eudev-openrc \
+                mesa-dri-gallium
+              chroot /target /sbin/rc-update add dbus default
+              chroot /target /sbin/rc-update add elogind default
+              chroot /target /sbin/rc-update add udev sysinit
+              chroot /target /sbin/rc-update add udev-trigger sysinit
+              chroot /target /sbin/rc-update add udev-settle sysinit
+              chroot /target /sbin/rc-update add udev-postmount default
+              chroot /target /bin/sh -ec "\
+                command -v phosh-session; \
+                command -v dbus-run-session; \
+                test -e /dev/null; \
+                apk info -e phosh"
+            '
+
+          cat > "$RUNNER_TEMP/a21s-phosh-session" <<'SESSION'
+          #!/bin/sh
+          export XDG_SESSION_TYPE=wayland
+          export XDG_CURRENT_DESKTOP=Phosh
+          export XDG_RUNTIME_DIR=/run/user/0
+          export LIBSEAT_BACKEND=direct
+          export WLR_RENDERER=pixman
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 0700 "$XDG_RUNTIME_DIR"
+          while :; do
+            echo '[A21s] Starting Phosh with software rendering.' >/dev/console
+            /usr/bin/dbus-run-session -- /usr/bin/phosh-session \
+              >>/var/log/a21s-phosh.log 2>&1
+            result=$?
+            echo "[A21s] Phosh exited ($result); USB-keyboard shell is available." >/dev/console
+            /bin/sh -l
+            /bin/busybox sleep 2
+          done
+          SESSION
+          sudo install -D -m 0755 "$RUNNER_TEMP/a21s-phosh-session" \
+            "$rootfs/usr/local/sbin/a21s-phosh-session"
+          sudo mkdir -p artifacts
+          sudo tar --sort=name --numeric-owner --owner=0 --group=0 \
+            -czf artifacts/rootfs-phosh.tar.gz -C "$rootfs" .
+          sudo du -sh "$rootfs" artifacts/rootfs-phosh.tar.gz
+          sudo tee artifacts/README-PHOSH-RU.txt >/dev/null <<'INFO'
+          Alpine Linux v3.24.3 AArch64 based on the official minirootfs.
+          Includes Phosh, Phoc, D-Bus, elogind, eudev and Mesa software rendering.
+          On boot, the A21s initramfs prefers this rootfs when named rootfs-phosh.tar.gz.
+          Place it in /data/local/rootfs-phosh.tar.gz or /cache/rootfs-phosh.tar.gz.
+          The Phosh session starts on tty1; if it exits, a local root shell remains for USB HID keyboard use.
+          This uses the existing kernel and simpledrm; the handset display path still needs physical verification.
+          INFO
+
+      - name: Upload Alpine Phosh rootfs
+        uses: actions/upload-artifact@v4
+        with:
+          name: a21s-alpine-phosh-rootfs
+          path: artifacts/
+          if-no-files-found: error
           retention-days: 14

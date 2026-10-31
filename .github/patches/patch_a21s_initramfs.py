@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add A21s USB, console font, touchscreen keyboard, and rootfs boot setup."""
+"""Add A21s USB, console font, and rootfs boot setup."""
 import re
 import sys
 from pathlib import Path
@@ -17,8 +17,16 @@ otg_setup = (
     "  /bin/busybox sleep 1\n"
     "  tries=$((tries + 1))\n"
     "done\n"
-    "/bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true\n"
-    "/bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true\n"
+    "otg_try=0\n"
+    "while [ \"$otg_try\" -lt 6 ]; do\n"
+    "  /bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true\n"
+    "  /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true\n"
+    "  if /bin/busybox grep -q 'VBUS boost enabled' /run/a21s-otg-status; then\n"
+    "    break\n"
+    "  fi\n"
+    "  otg_try=$((otg_try + 1))\n"
+    "  /bin/busybox sleep 1\n"
+    "done\n"
     "/bin/busybox sleep 2\n"
     "echo '[A21s] USB devices:' >/dev/console\n"
     "for usb in /sys/bus/usb/devices/*; do\n"
@@ -69,21 +77,60 @@ if archive_message not in text:
         raise SystemExit("Could not uniquely find the archive-found message")
     text = text.replace(archive_anchor, archive_message, 1)
 
+if '"$search_root/rootfs-phosh.tar.gz"' not in text:
+    path_pattern = re.compile(
+        r'(?m)^([ \t]*)"\$search_root/rootfs\.tar\.gz" \\\n'
+    )
+    text, count = path_pattern.subn(
+        lambda match: "\n".join(
+            match.group(1) + path
+            for path in (
+                '"$search_root/rootfs-phosh.tar.gz" \\',
+                '"$search_root/alpine-phosh-rootfs.tar.gz" \\',
+                '"$search_root/phosh-rootfs.tar.gz" \\',
+                '"$search_root/rootfs.tar.gz" \\',
+            )
+        ) + "\n",
+        text,
+    )
+    if count != 1:
+        raise SystemExit("Could not find the rootfs archive preference list")
+
+if "-iname 'rootfs-phosh*.tar.gz'" not in text:
+    old_pattern = "-iname 'rootfs.tar.gz' \\\n"
+    new_patterns = (
+        "-iname 'rootfs-phosh*.tar.gz' \\\n"
+        "      -o -iname 'alpine-phosh*.tar.gz' \\\n"
+        "      -o -iname 'phosh-rootfs*.tar.gz' \\\n"
+        "      -o -iname 'rootfs.tar.gz' \\\n"
+    )
+    count = text.count(old_pattern)
+    text = text.replace(old_pattern, new_patterns)
+    if count != 3:
+        raise SystemExit(f"Expected 3 rootfs archive find patterns, found {count}")
+
+text = text.replace("-o size=768M alpine-root /newroot", "-o size=1536M alpine-root /newroot")
+
 if "prepare_alpine_console() {" not in text:
     finish_anchor = 'finish_root() {\n  rootdir="$1"\n'
     finish_setup = '''prepare_alpine_console() {
   target="$1"
-  /bin/busybox mkdir -p "$target/usr/sbin"
-  /bin/busybox cp /bin/a21s-touchkbd "$target/usr/sbin/a21s-touchkbd"
   if [ -f "$target/etc/inittab" ]; then
-    if /bin/busybox grep -q '^tty1::respawn:' "$target/etc/inittab"; then
-      /bin/busybox sed -i 's#^tty1::respawn:.*#tty1::respawn:/bin/sh -l#' "$target/etc/inittab"
+    if [ -x "$target/usr/local/sbin/a21s-phosh-session" ]; then
+      tty1_command='/usr/local/sbin/a21s-phosh-session'
     else
-      echo 'tty1::respawn:/bin/sh -l' >> "$target/etc/inittab"
+      tty1_command='/bin/sh -l'
     fi
-    if ! /bin/busybox grep -q 'a21s-touchkbd' "$target/etc/inittab"; then
-      echo '::respawn:/usr/sbin/a21s-touchkbd' >> "$target/etc/inittab"
+    if /bin/busybox grep -q '^tty1::respawn:' "$target/etc/inittab"; then
+      /bin/busybox sed -i "s#^tty1::respawn:.*#tty1::respawn:$tty1_command#" "$target/etc/inittab"
+    else
+      echo "tty1::respawn:$tty1_command" >> "$target/etc/inittab"
     fi
+  fi
+  if [ -x "$target/usr/local/sbin/a21s-phosh-session" ]; then
+    echo '[A21s] Starting Phosh on tty1; USB HID keyboard is enabled.' >/dev/console
+  else
+    echo '[A21s] Local root shell on tty1; USB HID keyboard input enabled.' >/dev/console
   fi
 }
 
@@ -91,7 +138,6 @@ finish_root() {
   rootdir="$1"
   if [ "$rootdir" = /newroot ]; then
     prepare_alpine_console "$rootdir"
-    echo '[A21s] Local root shell and touch keyboard enabled on tty1.' >/dev/console
   fi
 '''
     if text.count(finish_anchor) != 1:
@@ -113,7 +159,6 @@ if 'exec /bin/busybox switch_root "$rootdir" /sbin/init' not in text:
 if "setsid -c /bin/busybox sh -i" not in text:
     old_shell = "exec /bin/busybox sh\n"
     new_shell = (
-        "/bin/a21s-touchkbd >/dev/console 2>&1 &\n"
         "while :; do\n"
         "  /bin/busybox sh -c \\\n"
         "    'exec </dev/tty1 >/dev/tty1 2>&1; exec /bin/busybox setsid -c /bin/busybox sh -i'\n"
@@ -150,4 +195,4 @@ if "[A21s] Registered input event devices:" not in text:
     text = text.replace(shell_anchor, shell_anchor + shell_diagnostics, 1)
 
 init.write_text(text)
-print("Initramfs configures the larger console font and touch keyboard, and runs switch_root as PID 1")
+print("Initramfs configures the larger console font and USB keyboard console, and runs switch_root as PID 1")

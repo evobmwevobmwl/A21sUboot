@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kd.h>
+#include <linux/vt.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -78,11 +79,18 @@ int main(void)
 		if (fd < 0)
 			continue;
 		ret = set_large_font(fd);
-		close(fd);
 		if (ret == 0) {
-			puts("[A21s] Console font enlarged to 16x24.");
+			if (i == 0) {
+				int console = 1;
+
+				if (ioctl(fd, VT_ACTIVATE, console) == 0)
+					(void)ioctl(fd, VT_WAITACTIVE, console);
+			}
+			close(fd);
+			puts("[A21s] Console font enlarged to 16x24; tty1 selected.");
 			return 0;
 		}
+		close(fd);
 	}
 
 	printf("[A21s] Could not enlarge console font: %s\n", strerror(-ret));
