@@ -1,4 +1,4 @@
-name: Build uniLoader Boot-sized test
+name: Build uniLoader Boot startup probe
 
 on:
   workflow_dispatch:
@@ -7,6 +7,7 @@ on:
       - .github/workflows/build-uniloader-boot-test.yml
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -18,6 +19,8 @@ jobs:
     name: Build compact uniLoader for SM-A217F
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    env:
+      KERNEL_RUN_ID: '40764327953'
     steps:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
@@ -30,8 +33,10 @@ jobs:
             binutils-aarch64-linux-gnu \
             bison \
             build-essential \
+            cpio \
             flex \
             gcc-aarch64-linux-gnu \
+            gzip \
             libelf-dev \
             libncurses-dev \
             libssl-dev \
@@ -51,33 +56,68 @@ jobs:
           git -C uniloader rev-parse HEAD | tee uniloader-commit.txt
           test -f uniloader/configs/a21s_defconfig
 
-      - name: Configure A21s with embedded Linux disabled
+      - name: Download A21s DTB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: a21s-linux-kernel
+          path: kernel-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ env.KERNEL_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Stage a tiny loader startup probe
+        run: |
+          set -euo pipefail
+          dtb="$(find kernel-artifact -type f -name exynos850-a217f.dtb -print -quit)"
+          if [ -z "$dtb" ]; then
+            echo '::error::A21s DTB is missing from the kernel artifact.'
+            exit 1
+          fi
+
+          mkdir -p uniloader/blob "$RUNNER_TEMP/empty-initramfs/dev"
+          cp "$dtb" uniloader/blob/dtb
+
+          # Valid ARM64 Image header with a harmless WFI loop as its entry code.
+          # This probes uniLoader startup only; it is deliberately not Linux.
+          python3 - <<'PY'
+          import struct
+          image = bytearray(4096)
+          struct.pack_into('<I', image, 0, 0x14000010)  # branch to offset 64
+          struct.pack_into('<I', image, 4, 0xD503201F)   # nop
+          struct.pack_into('<Q', image, 8, len(image))
+          struct.pack_into('<Q', image, 16, 0x80000)
+          struct.pack_into('<I', image, 56, 0x644D5241)  # ARM64 Image magic
+          struct.pack_into('<I', image, 64, 0xD503207F)  # wfi
+          struct.pack_into('<I', image, 68, 0x17FFFFFF)  # branch back to wfi
+          with open('uniloader/blob/Image', 'wb') as f:
+              f.write(image)
+          PY
+
+          (
+            cd "$RUNNER_TEMP/empty-initramfs"
+            find . -print0 | LC_ALL=C sort -z \
+              | cpio --null --create --format=newc --owner=0:0 --quiet
+          ) | gzip -n -9 > uniloader/blob/ramdisk
+
+          file uniloader/blob/Image uniloader/blob/dtb uniloader/blob/ramdisk
+          sha256sum uniloader/blob/Image uniloader/blob/dtb uniloader/blob/ramdisk
+          if [ -f kernel-artifact/kernel-commit.txt ]; then
+            cp kernel-artifact/kernel-commit.txt .
+          fi
+
+      - name: Configure A21s loader
         run: |
           set -euxo pipefail
           build_dir="$RUNNER_TEMP/uniloader-build"
           mkdir -p "$build_dir"
-
           make -C uniloader \
             O="$build_dir" \
             ARCH=aarch64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             a21s_defconfig
-
-          sed -i \
-            's/^CONFIG_EMBED_LINUX=y$/# CONFIG_EMBED_LINUX is not set/' \
-            "$build_dir/.config"
-
-          if grep -q '^CONFIG_EMBED_LINUX=y$' "$build_dir/.config"; then
-            echo '::error::Embedded Linux remained enabled.'
-            exit 1
-          fi
-
-          grep -E \
-            '^(CONFIG_(TEXT_BASE|PAYLOAD_ENTRY|RAMDISK_ENTRY|EMBED_LINUX))|^# CONFIG_EMBED_LINUX' \
-            "$build_dir/.config" || true
           cp "$build_dir/.config" uniloader.config
 
-      - name: Build compact uniLoader
+      - name: Build uniLoader
         run: |
           set -euxo pipefail
           make -C uniloader \
@@ -88,7 +128,12 @@ jobs:
 
           test -s "$RUNNER_TEMP/uniloader-build/uniLoader"
           file "$RUNNER_TEMP/uniloader-build/uniLoader"
-          stat -c '%n %s bytes' "$RUNNER_TEMP/uniloader-build/uniLoader"
+          size="$(stat -c '%s' "$RUNNER_TEMP/uniloader-build/uniLoader")"
+          echo "uniLoader payload size: $size bytes"
+          if [ "$size" -ge $((32 * 1024 * 1024)) ]; then
+            echo '::error::uniLoader payload is too large for the Boot test image.'
+            exit 1
+          fi
 
       - name: Collect Boot-test build and log metadata
         if: always()
@@ -106,9 +151,10 @@ jobs:
             | sort > artifacts/build-file-list.txt || true
           {
             echo 'Target: Samsung Galaxy A21s SM-A217F / Exynos 850'
-            echo 'Configuration: a21s_defconfig with CONFIG_EMBED_LINUX disabled'
-            echo 'Purpose: compact Boot-partition startup test only'
-            echo 'No Linux kernel, Alpine rootfs, or USB-root setup is embedded.'
+            echo 'Configuration: a21s_defconfig'
+            echo 'Purpose: Boot-partition uniLoader startup probe'
+            echo 'Embedded payload is a harmless ARM64 WFI stub, not Linux.'
+            echo 'No Alpine rootfs or USB-root setup is embedded.'
             echo
             ls -lh artifacts/ || true
           } > artifacts/build-info.txt
