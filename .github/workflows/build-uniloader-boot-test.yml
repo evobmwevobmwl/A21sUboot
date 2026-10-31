@@ -1,0 +1,130 @@
+name: Build uniLoader Boot-sized test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-uniloader-boot-test.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a21s-uniloader-boot-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build compact uniLoader for SM-A217F
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            binutils-aarch64-linux-gnu \
+            bison \
+            build-essential \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            make \
+            python3 \
+            rsync
+
+      - name: Fetch pinned uniLoader source
+        run: |
+          set -eu
+          git init uniloader
+          git -C uniloader remote add origin \
+            https://github.com/samsungexynos850/uniLoader.git
+          git -C uniloader fetch --depth=1 origin \
+            06a1bba90f6f00f4a3f745eb072c54e2190c0832
+          git -C uniloader checkout --detach FETCH_HEAD
+          git -C uniloader rev-parse HEAD | tee uniloader-commit.txt
+          test -f uniloader/configs/a21s_defconfig
+
+      - name: Configure A21s with embedded Linux disabled
+        run: |
+          set -euxo pipefail
+          build_dir="$RUNNER_TEMP/uniloader-build"
+          mkdir -p "$build_dir"
+
+          make -C uniloader \
+            O="$build_dir" \
+            ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            a21s_defconfig
+
+          sed -i \
+            's/^CONFIG_EMBED_LINUX=y$/# CONFIG_EMBED_LINUX is not set/' \
+            "$build_dir/.config"
+
+          make -C uniloader \
+            O="$build_dir" \
+            ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          if grep -q '^CONFIG_EMBED_LINUX=y$' "$build_dir/.config"; then
+            echo '::error::Embedded Linux remained enabled.'
+            exit 1
+          fi
+
+          grep -E \
+            '^(CONFIG_(TEXT_BASE|PAYLOAD_ENTRY|RAMDISK_ENTRY|EMBED_LINUX))|^# CONFIG_EMBED_LINUX' \
+            "$build_dir/.config" || true
+          cp "$build_dir/.config" uniloader.config
+
+      - name: Build compact uniLoader
+        run: |
+          set -euxo pipefail
+          make -C uniloader \
+            O="$RUNNER_TEMP/uniloader-build" \
+            ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)"
+
+          test -s "$RUNNER_TEMP/uniloader-build/uniLoader"
+          file "$RUNNER_TEMP/uniloader-build/uniLoader"
+          stat -c '%n %s bytes' "$RUNNER_TEMP/uniloader-build/uniLoader"
+
+      - name: Collect Boot-test build and log metadata
+        if: always()
+        run: |
+          mkdir -p artifacts
+          build_dir="$RUNNER_TEMP/uniloader-build"
+          for name in uniLoader uniLoader.o uniLoader.gz; do
+            if [ -f "$build_dir/$name" ]; then
+              cp "$build_dir/$name" artifacts/
+            fi
+          done
+          [ ! -f "$build_dir/.config" ] || cp "$build_dir/.config" artifacts/uniloader.config
+          [ ! -f uniloader-commit.txt ] || cp uniloader-commit.txt artifacts/
+          find "$build_dir" -type f -printf '%p %s bytes\n' 2>/dev/null \
+            | sort > artifacts/build-file-list.txt || true
+          {
+            echo 'Target: Samsung Galaxy A21s SM-A217F / Exynos 850'
+            echo 'Configuration: a21s_defconfig with CONFIG_EMBED_LINUX disabled'
+            echo 'Purpose: compact Boot-partition startup test only'
+            echo 'No Linux kernel, Alpine rootfs, or USB-root setup is embedded.'
+            echo
+            ls -lh artifacts/ || true
+          } > artifacts/build-info.txt
+          sha256sum artifacts/uniLoader 2>/dev/null > artifacts/SHA256SUMS || true
+
+      - name: Upload compact uniLoader artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a21s-uniloader-boot-test
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
