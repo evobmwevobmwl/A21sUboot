@@ -244,6 +244,21 @@ jobs:
           done
           /bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true
           /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
+          /bin/busybox sleep 2
+          echo '[A21s] USB devices:' >/dev/console
+          for usb in /sys/bus/usb/devices/*; do
+            [ -r "$usb/idVendor" ] || continue
+            vendor="$(/bin/busybox cat "$usb/idVendor" 2>/dev/null)"
+            product="$(/bin/busybox cat "$usb/idProduct" 2>/dev/null)"
+            name="$(/bin/busybox cat "$usb/product" 2>/dev/null)"
+            echo "  $(/bin/busybox basename "$usb"): $vendor:$product $name" >/dev/console
+          done
+          echo '[A21s] Input event devices:' >/dev/console
+          for event in /sys/class/input/event*; do
+            [ -e "$event" ] || continue
+            name="$(/bin/busybox cat "$event/device/name" 2>/dev/null)"
+            echo "  $(/bin/busybox basename "$event"): $name" >/dev/console
+          done
           echo '[A21s] Linux initramfs started; scanning eMMC, SD and USB storage' >/dev/console
 
           is_emmc() {
@@ -265,7 +280,7 @@ jobs:
             /bin/busybox mount --move /dev "$rootdir/dev" 2>/dev/null || true
             /bin/busybox mount --move /proc "$rootdir/proc" 2>/dev/null || true
             /bin/busybox mount --move /sys "$rootdir/sys" 2>/dev/null || true
-            /bin/busybox switch_root "$rootdir" /sbin/init
+            exec /bin/busybox switch_root "$rootdir" /sbin/init
             echo '[A21s] switch_root failed; dropping to initramfs shell' >/dev/console
             exec /bin/busybox sh
           }
