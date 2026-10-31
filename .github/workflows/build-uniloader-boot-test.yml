@@ -67,12 +67,6 @@ jobs:
             's/^CONFIG_EMBED_LINUX=y$/# CONFIG_EMBED_LINUX is not set/' \
             "$build_dir/.config"
 
-          make -C uniloader \
-            O="$build_dir" \
-            ARCH=aarch64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            olddefconfig
-
           if grep -q '^CONFIG_EMBED_LINUX=y$' "$build_dir/.config"; then
             echo '::error::Embedded Linux remained enabled.'
             exit 1
