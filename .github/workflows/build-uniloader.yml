@@ -146,7 +146,7 @@ jobs:
       - name: Build A21s kernel and device tree
         run: |
           set -euxo pipefail
-          make -C linux -j2 \
+          make -C linux -j"$(nproc)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             Image dtbs
