@@ -9,7 +9,7 @@ on:
         default: '40764327953'
         type: string
       reuse_payload_run_id:
-        description: Reuse a kernel artifact and build the USB-host diagnostic image without rebuilding the kernel
+        description: Reuse a kernel artifact and build the source-gated OTG image without rebuilding the kernel
         required: false
         default: ''
         type: string
@@ -215,9 +215,9 @@ jobs:
           mkdir -p "$work/lib/firmware"
           install -m 0644 "$firmware" "$work/lib/firmware/td4150_a21s.bin"
           aarch64-linux-gnu-gcc -Os -static -s \
-            .github/patches/a21s-otg-diagnostic.c \
-            -o "$work/bin/a21s-otg-diagnostic"
-          file "$work/bin/a21s-otg-diagnostic" "$work/lib/firmware/td4150_a21s.bin"
+            .github/patches/a21s-otg-init.c \
+            -o "$work/bin/a21s-otg-init"
+          file "$work/bin/a21s-otg-init" "$work/lib/firmware/td4150_a21s.bin"
 
           test -x "$alpine/bin/busybox"
           test -e "$alpine/lib/ld-musl-aarch64.so.1"
@@ -235,9 +235,15 @@ jobs:
           /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
           /bin/busybox mount -t proc proc /proc 2>/dev/null || true
           /bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
-          /bin/busybox sleep 1
-          /bin/a21s-otg-diagnostic >/dev/console 2>&1 || true
           /bin/busybox mkdir -p /mnt/source /newroot /newroot-bind /run
+          /bin/busybox sleep 1
+          tries=0
+          while [ ! -c /dev/i2c-0 ] && [ "$tries" -lt 5 ]; do
+            /bin/busybox sleep 1
+            tries=$((tries + 1))
+          done
+          /bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true
+          /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
           echo '[A21s] Linux initramfs started; scanning eMMC, SD and USB storage' >/dev/console
 
           is_emmc() {
@@ -404,6 +410,8 @@ jobs:
 
           echo '[A21s] Alpine not found. Check that the rootfs is extracted or rootfs.tar.gz is present.' >/dev/console
           echo '[A21s] Emergency shell: inspect /dev, /sys/class/block and mount manually.' >/dev/console
+          echo '[A21s] OTG/VBUS status:' >/dev/console
+          /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
           echo '[A21s] USB block devices:' >/dev/console
           for block in /sys/class/block/sd*; do
             [ -e "$block" ] || continue
@@ -563,9 +571,10 @@ jobs:
             echo 'Kernel source commit:'
             cat kernel-commit.txt 2>/dev/null || true
             echo 'Kernel was built with A21s source config plus USB dual-role and F2FS.'
-            echo 'The A21s Linux DTB selects USB host mode and enables I2C0 for read-only S2MU106 diagnostics.'
+            echo 'The A21s Linux DTB selects USB host mode and enables I2C0 for S2MU106 OTG control.'
             echo 'Initramfs includes verified TD4150 firmware and scans USB storage before eMMC.'
-            echo 'USB/charger state diagnostics are read-only; they do not modify PMIC registers.'
+            echo 'S2MU106 OTG boost is enabled only after the PDIC reports attached source/DFP; OCP limit is 1.2 A.'
+            echo 'Charger registers are snapshotted and restored if the vendor sequence fails.'
             echo 'Rootfs archives found on storage are extracted to RAM.'
             echo 'Outer Samsung DT table is reused from the A21s probe that reached uniLoader.'
             echo 'The separate mainline A21s DTB remains embedded inside uniLoader for Linux.'
@@ -590,7 +599,7 @@ jobs:
           retention-days: 14
 
   repack:
-    name: Build A21s USB-host diagnostic image without rebuilding the kernel
+    name: Build A21s OTG-enabled image without rebuilding the kernel
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.reuse_payload_run_id != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -630,7 +639,7 @@ jobs:
           run-id: ${{ inputs.reuse_payload_run_id }}
           github-token: ${{ github.token }}
 
-      - name: Force host DT, add touch firmware and S2MU106 read-only diagnostics
+      - name: Enable host DT, add touch firmware and source-gated S2MU106 OTG
         run: |
           set -euxo pipefail
 
@@ -660,8 +669,8 @@ jobs:
             | (cd "$root" && cpio -idm --quiet --no-absolute-filenames)
           install -D -m 0644 "$firmware" "$root/lib/firmware/td4150_a21s.bin"
           aarch64-linux-gnu-gcc -Os -static -s \
-            .github/patches/a21s-otg-diagnostic.c \
-            -o "$root/bin/a21s-otg-diagnostic"
+            .github/patches/a21s-otg-init.c \
+            -o "$root/bin/a21s-otg-init"
 
           python3 .github/patches/patch_a21s_initramfs.py "$root/init"
 
@@ -701,7 +710,7 @@ jobs:
           git -C mkbootimg fetch --depth=1 origin "$MKBOOTIMG_COMMIT"
           git -C mkbootimg checkout --detach FETCH_HEAD
 
-      - name: Package rebuilt uniLoader with the proven Samsung outer DT table
+      - name: Package OTG-enabled uniLoader with the proven Samsung outer DT table
         run: |
           set -euxo pipefail
           mkdir -p artifacts
@@ -737,13 +746,13 @@ jobs:
             --tags_offset 0x100 \
             --dtb_offset 0x01f00000 \
             --board exynos850 \
-            --output artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img
+            --output artifacts/boot-uniloader-a21s-alpine-otg-enabled.img
 
           python3 - <<'PY'
           from pathlib import Path
           import struct
 
-          image = Path("artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img")
+          image = Path("artifacts/boot-uniloader-a21s-alpine-otg-enabled.img")
           data = image.read_bytes()
           kernel_size, kernel_addr = struct.unpack_from("<II", data, 8)
           ramdisk_size = struct.unpack_from("<I", data, 16)[0]
@@ -787,21 +796,22 @@ jobs:
             echo 'Outer DT table: exact table from the A21s probe that reached uniLoader.'
             echo 'The existing Linux Image is reused; the kernel was not rebuilt.'
             echo 'uniLoader was rebuilt with DWC3 forced to host mode and I2C0 enabled.'
-            echo 'Initramfs contains verified A21s touchscreen firmware and read-only S2MU106 status diagnostics.'
-            echo 'The diagnostic does not write to charger or PMIC registers.'
+            echo 'Initramfs contains verified A21s touchscreen firmware.'
+            echo 'S2MU106 VBUS boost is enabled only if PDIC confirms source/DFP; OCP is limited to 1.2 A.'
+            echo 'The charger is restored to its saved register state if the vendor setup sequence fails.'
             echo 'A21s touchscreen vddio uses the existing dummy regulator entry.'
             echo 'This is a Boot-partition diagnostic image, not a Recovery image.'
             ls -lh artifacts/ || true
           } > artifacts/README-BOOT-RU.txt
-          if [ -f artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img ]; then
-            sha256sum artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img > artifacts/SHA256SUMS
+          if [ -f artifacts/boot-uniloader-a21s-alpine-otg-enabled.img ]; then
+            sha256sum artifacts/boot-uniloader-a21s-alpine-otg-enabled.img > artifacts/SHA256SUMS
           fi
 
-      - name: Upload A21s USB host diagnostic Boot artifact
+      - name: Upload A21s OTG-enabled Boot artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: a21s-uniloader-alpine-usb-host-diagnostic
+          name: a21s-uniloader-alpine-otg-enabled
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14

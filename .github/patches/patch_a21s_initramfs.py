@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Add A21s OTG diagnostics and prioritize USB storage in initramfs."""
+"""Add source-gated A21s OTG setup and prioritize USB storage in initramfs."""
 import sys
 from pathlib import Path
 
@@ -7,18 +7,21 @@ from pathlib import Path
 init = Path(sys.argv[1])
 text = init.read_text()
 
-startup_anchor = (
-    "echo '[A21s] Linux initramfs started; scanning eMMC, SD and USB storage' "
-    ">/dev/console\n"
-)
-startup_diagnostic = (
+setup_anchor = "/bin/busybox mkdir -p /mnt/source /newroot /newroot-bind /run\n"
+otg_setup = (
     "/bin/busybox sleep 1\n"
-    "/bin/a21s-otg-diagnostic >/dev/console 2>&1 || true\n"
+    "tries=0\n"
+    "while [ ! -c /dev/i2c-0 ] && [ \"$tries\" -lt 5 ]; do\n"
+    "  /bin/busybox sleep 1\n"
+    "  tries=$((tries + 1))\n"
+    "done\n"
+    "/bin/a21s-otg-init >/run/a21s-otg-status 2>&1 || true\n"
+    "/bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true\n"
 )
-if "/bin/a21s-otg-diagnostic" not in text:
-    if text.count(startup_anchor) != 1:
-        raise SystemExit("Could not uniquely find the initramfs startup marker")
-    text = text.replace(startup_anchor, startup_anchor + startup_diagnostic, 1)
+if "/bin/a21s-otg-init" not in text:
+    if text.count(setup_anchor) != 1:
+        raise SystemExit("Could not uniquely find the initramfs device setup marker")
+    text = text.replace(setup_anchor, setup_anchor + otg_setup, 1)
 
 old_first = "for dev in /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*"
 new_first = "for dev in /dev/sd[a-z] /dev/sd[a-z][0-9]*"
@@ -37,6 +40,8 @@ shell_anchor = (
     ">/dev/console\n"
 )
 shell_diagnostics = """\
+echo '[A21s] OTG/VBUS status:' >/dev/console
+/bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
 echo '[A21s] USB block devices:' >/dev/console
 for block in /sys/class/block/sd*; do
   [ -e "$block" ] || continue
@@ -55,4 +60,4 @@ if "[A21s] Registered input event devices:" not in text:
     text = text.replace(shell_anchor, shell_anchor + shell_diagnostics, 1)
 
 init.write_text(text)
-print("Initramfs now checks USB first and reports USB/input devices")
+print("Initramfs enables VBUS only on confirmed source attach, scans USB first, and reports USB/input devices")
