@@ -8,6 +8,11 @@ on:
         required: true
         default: '40764327953'
         type: string
+      reuse_payload_run_id:
+        description: Repackage the existing kernel/uniloader artifact instead of rebuilding it
+        required: false
+        default: ''
+        type: string
   push:
     paths:
       - .github/workflows/build-uniloader.yml
@@ -23,6 +28,7 @@ concurrency:
 jobs:
   build:
     name: Build SM-A217F mainline kernel and Alpine boot image
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.reuse_payload_run_id == '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
@@ -433,28 +439,12 @@ jobs:
           git -C mkbootimg checkout --detach FETCH_HEAD
 
           mkdir -p artifacts
-          python3 - <<'PY'
-          from pathlib import Path
-          import struct
-
-          dtb = Path("linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb").read_bytes()
-          assert dtb[:4] == bytes.fromhex("d00dfeed"), "Linux DTB is not an FDT"
-          fdt_size = struct.unpack_from(">I", dtb, 4)[0]
-          assert 40 <= fdt_size <= len(dtb)
-          dtb = dtb[:fdt_size]
-
-          # Match the single-entry Android DT table used by the A21s probe image.
-          table = struct.pack(">8I", 0xd7b7ab1e, 64 + fdt_size, 32, 32, 1, 32, 2048, 0)
-          table += struct.pack(">8I", fdt_size, 64, 0, 0, 0, 0xff000000, 0, 0)
-          table += dtb
-          table += bytes((-len(table)) % 2048)
-          Path("artifacts/exynos850-a217f-dtb-table.img").write_bytes(table)
-          print(f"A21s Android DT table: {len(table)} bytes; FDT={fdt_size} bytes")
-          PY
+          cp boot/a21s-sboot-compatible-dtb-table.img \
+            artifacts/a21s-sboot-compatible-dtb-table.img
 
           python3 mkbootimg/mkbootimg.py \
             --kernel "$RUNNER_TEMP/uniloader-build/uniLoader" \
-            --dtb artifacts/exynos850-a217f-dtb-table.img \
+            --dtb artifacts/a21s-sboot-compatible-dtb-table.img \
             --header_version 2 \
             --pagesize 2048 \
             --base 0x10000000 \
@@ -493,6 +483,8 @@ jobs:
           dtb_start = page_size + align(kernel_size, page_size) \
               + align(ramdisk_size, page_size) + align(second_size, page_size)
           table = data[dtb_start:dtb_start + dtb_size]
+          known_good_table = pathlib.Path("boot/a21s-sboot-compatible-dtb-table.img").read_bytes()
+          assert table == known_good_table
           magic, total_size, header_size, entry_size, count, entries_offset, table_page, version = \
               struct.unpack_from(">8I", table)
           assert (magic, header_size, entry_size, count, entries_offset, table_page, version) == \
@@ -536,7 +528,8 @@ jobs:
             echo 'Kernel was built with A21s source config plus USB dual-role and F2FS.'
             echo 'Kernel includes USB DWC3 dual-role, USB storage, F2FS, ext4, VFAT and exFAT.'
             echo 'Initramfs scans eMMC, SD and USB block devices; rootfs archives are extracted to RAM.'
-            echo 'The outer A21s DTB uses a single-entry Android DT table wrapper.'
+            echo 'Outer Samsung DT table is reused from the A21s probe that reached uniLoader.'
+            echo 'The separate mainline A21s DTB remains embedded inside uniLoader for Linux.'
             echo 'The image is a Boot-partition test image. It is not a Recovery image.'
             echo 'Physical Linux/Alpine boot is not yet verified.'
             echo
@@ -553,6 +546,154 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: a21s-uniloader-alpine-boot
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  repack:
+    name: Repackage existing payload without rebuilding the kernel
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.reuse_payload_run_id != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MKBOOTIMG_COMMIT: d3e0acd56e80dba7cfa5b9240d731c7bf00045bd
+
+    steps:
+      - name: Checkout A21sUboot
+        uses: actions/checkout@v4
+
+      - name: Download previously built payload
+        uses: actions/download-artifact@v4
+        with:
+          name: a21s-uniloader-alpine-boot
+          path: source
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.reuse_payload_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Fetch pinned AOSP mkbootimg
+        run: |
+          set -euxo pipefail
+          git init mkbootimg
+          git -C mkbootimg remote add origin \
+            https://android.googlesource.com/platform/system/tools/mkbootimg
+          git -C mkbootimg fetch --depth=1 origin "$MKBOOTIMG_COMMIT"
+          git -C mkbootimg checkout --detach FETCH_HEAD
+
+      - name: Repackage with the proven Samsung outer DT table
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp boot/a21s-sboot-compatible-dtb-table.img artifacts/
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import struct
+
+          source = Path("source")
+          old = (source / "boot-uniloader-a21s-alpine.img").read_bytes()
+          assert old[:8] == b"ANDROID!"
+          kernel_size, kernel_addr = struct.unpack_from("<II", old, 8)
+          ramdisk_size = struct.unpack_from("<I", old, 16)[0]
+          second_size = struct.unpack_from("<I", old, 24)[0]
+          page_size = struct.unpack_from("<I", old, 36)[0]
+          version = struct.unpack_from("<I", old, 40)[0]
+          assert (version, page_size, kernel_addr, ramdisk_size, second_size) == \
+              (2, 2048, 0x80080000, 0, 0)
+
+          def align(value, page):
+              return (value + page - 1) // page * page
+
+          old_dtb_size = struct.unpack_from("<I", old, 1648)[0]
+          dtb_start = page_size + align(kernel_size, page_size) \
+              + align(ramdisk_size, page_size) + align(second_size, page_size)
+          assert old[dtb_start:dtb_start + 4] == bytes.fromhex("d00dfeed")
+
+          payload = old[page_size:page_size + kernel_size]
+          for name in ("Image", "exynos850-a217f.dtb", "initramfs.cpio.gz"):
+              assert (source / name).read_bytes() in payload, \
+                  f"{name} is missing from the previously verified uniLoader payload"
+          Path(os.environ["RUNNER_TEMP"], "uniLoader.raw").write_bytes(payload)
+
+          table = Path("boot/a21s-sboot-compatible-dtb-table.img").read_bytes()
+          assert len(table) % page_size == 0
+          assert struct.unpack_from(">I", table, 0)[0] == 0xd7b7ab1e
+          print(f"Reusing {len(payload)}-byte uniLoader and {len(table)}-byte known-good outer DT table")
+          PY
+
+          python3 mkbootimg/mkbootimg.py \
+            --kernel "$RUNNER_TEMP/uniLoader.raw" \
+            --dtb artifacts/a21s-sboot-compatible-dtb-table.img \
+            --header_version 2 \
+            --pagesize 2048 \
+            --base 0x10000000 \
+            --kernel_offset 0x70080000 \
+            --ramdisk_offset 0x01000000 \
+            --second_offset 0x00f00000 \
+            --tags_offset 0x100 \
+            --dtb_offset 0x01f00000 \
+            --board exynos850 \
+            --output artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          image = Path("artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img")
+          data = image.read_bytes()
+          kernel_size, kernel_addr = struct.unpack_from("<II", data, 8)
+          ramdisk_size = struct.unpack_from("<I", data, 16)[0]
+          second_size = struct.unpack_from("<I", data, 24)[0]
+          page_size = struct.unpack_from("<I", data, 36)[0]
+          version = struct.unpack_from("<I", data, 40)[0]
+          dtb_size = struct.unpack_from("<I", data, 1648)[0]
+          dtb_addr = struct.unpack_from("<Q", data, 1652)[0]
+          assert data[:8] == b"ANDROID!"
+          assert (version, page_size, kernel_addr, ramdisk_size, second_size) == \
+              (2, 2048, 0x80080000, 0, 0)
+          assert dtb_addr == 0x11f00000
+          assert image.stat().st_size <= 36 * 1024 * 1024
+
+          def align(value, page):
+              return (value + page - 1) // page * page
+
+          start = page_size + align(kernel_size, page_size) \
+              + align(ramdisk_size, page_size) + align(second_size, page_size)
+          outer = data[start:start + dtb_size]
+          known_good = Path("boot/a21s-sboot-compatible-dtb-table.img").read_bytes()
+          assert outer == known_good
+          magic, total, hsize, esize, count, entries, table_page, tversion = \
+              struct.unpack_from(">8I", outer)
+          assert (magic, hsize, esize, count, entries, table_page, tversion) == \
+              (0xd7b7ab1e, 32, 32, 1, 32, 2048, 0)
+          fdt_size, fdt_offset, dt_id, dt_rev, c0, c1, c2, c3 = \
+              struct.unpack_from(">8I", outer, 32)
+          assert total == 64 + fdt_size and fdt_offset == 64 and c1 == 0xff000000
+          assert outer[fdt_offset:fdt_offset + 4] == bytes.fromhex("d00dfeed")
+          print(f"Boot v2; Samsung DT table verified; FDT={fdt_size}; image={image.stat().st_size} bytes")
+          PY
+
+      - name: Collect repack metadata
+        if: always()
+        run: |
+          cp source/Image source/exynos850-a217f.dtb source/initramfs.cpio.gz artifacts/ 2>/dev/null || true
+          cp source/kernel-commit.txt source/uniloader-commit.txt artifacts/ 2>/dev/null || true
+          {
+            echo 'Outer DT table: exact table from the A21s probe that reached uniLoader.'
+            echo 'Linux Image, mainline DTB and Alpine initramfs are reused from the source artifact.'
+            echo 'Kernel was not rebuilt by this repack-only job.'
+            echo 'This image still needs a physical boot test; flash target is Boot only.'
+            ls -lh artifacts/ || true
+          } > artifacts/README-BOOT-RU.txt
+          if [ -f artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img ]; then
+            sha256sum artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img > artifacts/SHA256SUMS
+          fi
+
+      - name: Upload corrected A21s Boot artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a21s-uniloader-alpine-boot-sboot-dtb
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
