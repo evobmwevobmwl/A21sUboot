@@ -9,7 +9,7 @@ on:
         default: '40764327953'
         type: string
       reuse_payload_run_id:
-        description: Repackage the existing kernel/uniloader artifact instead of rebuilding it
+        description: Reuse a kernel artifact and build the USB-host diagnostic image without rebuilding the kernel
         required: false
         default: ''
         type: string
@@ -20,6 +20,10 @@ on:
 permissions:
   actions: read
   contents: read
+
+env:
+  A21S_FIRMWARE_COMMIT: 71ad9141a18a7599510796cfeef6d5d33a4ac3b9
+  A21S_FIRMWARE_SHA512: a9624ddaebe4885eedb81984f54f05c65d68114a371a5711878289380476f2ce710cfa96fb6ffc8d7ce2889715669009f48368344ac5095114d452a23549c465
 
 concurrency:
   group: a21s-alpine-uniloader-${{ github.ref }}
@@ -50,11 +54,13 @@ jobs:
             bison \
             build-essential \
             cpio \
+            curl \
             device-tree-compiler \
             dwarves \
             flex \
             gcc-aarch64-linux-gnu \
             gzip \
+            libc6-dev-arm64-cross \
             libelf-dev \
             libncurses-dev \
             libssl-dev \
@@ -72,6 +78,12 @@ jobs:
           test -f linux/arch/arm64/configs/fragments/exynos850-a217f.config
           test -f linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dts
           test "$(make -s -C linux ARCH=arm64 kernelversion)" = "7.3.0"
+
+      - name: Apply A21s USB host and touchscreen DT settings
+        run: |
+          set -euxo pipefail
+          python3 .github/patches/enable_a21s_usb_host.py \
+            linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dts
 
       - name: Configure compact A21s kernel with USB host and F2FS
         run: |
@@ -195,6 +207,18 @@ jobs:
           mkdir -p "$alpine"
           tar -xzf "$rootfs_tar" -C "$alpine"
 
+          firmware="$RUNNER_TEMP/td4150_a21s.bin"
+          curl -fL --retry 3 \
+            "https://raw.githubusercontent.com/samsungexynos850/firmware-samsung-a21s/$A21S_FIRMWARE_COMMIT/td4150_a21s.bin" \
+            -o "$firmware"
+          printf '%s  %s\n' "$A21S_FIRMWARE_SHA512" "$firmware" | sha512sum -c -
+          mkdir -p "$work/lib/firmware"
+          install -m 0644 "$firmware" "$work/lib/firmware/td4150_a21s.bin"
+          aarch64-linux-gnu-gcc -Os -static -s \
+            .github/patches/a21s-otg-diagnostic.c \
+            -o "$work/bin/a21s-otg-diagnostic"
+          file "$work/bin/a21s-otg-diagnostic" "$work/lib/firmware/td4150_a21s.bin"
+
           test -x "$alpine/bin/busybox"
           test -e "$alpine/lib/ld-musl-aarch64.so.1"
           test -e "$alpine/lib/libc.musl-aarch64.so.1"
@@ -211,6 +235,8 @@ jobs:
           /bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
           /bin/busybox mount -t proc proc /proc 2>/dev/null || true
           /bin/busybox mount -t sysfs sysfs /sys 2>/dev/null || true
+          /bin/busybox sleep 1
+          /bin/a21s-otg-diagnostic >/dev/console 2>&1 || true
           /bin/busybox mkdir -p /mnt/source /newroot /newroot-bind /run
           echo '[A21s] Linux initramfs started; scanning eMMC, SD and USB storage' >/dev/console
 
@@ -334,8 +360,8 @@ jobs:
 
           attempt=0
           while [ "$attempt" -lt 20 ]; do
-            for dev in /dev/mmcblk[0-9] /dev/mmcblk[0-9]p* \
-                       /dev/sd[a-z] /dev/sd[a-z][0-9]*; do
+          for dev in /dev/sd[a-z] /dev/sd[a-z][0-9]* \
+                     /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do
               [ -b "$dev" ] || continue
 
               for fs in ext4 f2fs vfat exfat; do
@@ -378,6 +404,17 @@ jobs:
 
           echo '[A21s] Alpine not found. Check that the rootfs is extracted or rootfs.tar.gz is present.' >/dev/console
           echo '[A21s] Emergency shell: inspect /dev, /sys/class/block and mount manually.' >/dev/console
+          echo '[A21s] USB block devices:' >/dev/console
+          for block in /sys/class/block/sd*; do
+            [ -e "$block" ] || continue
+            echo "  $(/bin/busybox basename "$block")" >/dev/console
+          done
+          echo '[A21s] Registered input event devices:' >/dev/console
+          for event in /sys/class/input/event*; do
+            [ -e "$event" ] || continue
+            name="$(/bin/busybox cat "$event/device/name" 2>/dev/null)"
+            echo "  $(/bin/busybox basename "$event"): $name" >/dev/console
+          done
           exec /bin/busybox sh
           INIT
           chmod 0755 "$work/init"
@@ -526,8 +563,10 @@ jobs:
             echo 'Kernel source commit:'
             cat kernel-commit.txt 2>/dev/null || true
             echo 'Kernel was built with A21s source config plus USB dual-role and F2FS.'
-            echo 'Kernel includes USB DWC3 dual-role, USB storage, F2FS, ext4, VFAT and exFAT.'
-            echo 'Initramfs scans eMMC, SD and USB block devices; rootfs archives are extracted to RAM.'
+            echo 'The A21s Linux DTB selects USB host mode and enables I2C0 for read-only S2MU106 diagnostics.'
+            echo 'Initramfs includes verified TD4150 firmware and scans USB storage before eMMC.'
+            echo 'USB/charger state diagnostics are read-only; they do not modify PMIC registers.'
+            echo 'Rootfs archives found on storage are extracted to RAM.'
             echo 'Outer Samsung DT table is reused from the A21s probe that reached uniLoader.'
             echo 'The separate mainline A21s DTB remains embedded inside uniLoader for Linux.'
             echo 'The image is a Boot-partition test image. It is not a Recovery image.'
@@ -551,16 +590,36 @@ jobs:
           retention-days: 14
 
   repack:
-    name: Repackage existing payload without rebuilding the kernel
+    name: Build A21s USB-host diagnostic image without rebuilding the kernel
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.reuse_payload_run_id != '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      UNILOADER_COMMIT: 06a1bba90f6f00f4a3f745eb072c54e2190c0832
       MKBOOTIMG_COMMIT: d3e0acd56e80dba7cfa5b9240d731c7bf00045bd
 
     steps:
       - name: Checkout A21sUboot
         uses: actions/checkout@v4
+
+      - name: Install repack and uniLoader build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            binutils-aarch64-linux-gnu \
+            bison \
+            build-essential \
+            cpio \
+            curl \
+            device-tree-compiler \
+            flex \
+            gcc-aarch64-linux-gnu \
+            gzip \
+            libc6-dev-arm64-cross \
+            libncurses-dev \
+            libssl-dev \
+            python3
 
       - name: Download previously built payload
         uses: actions/download-artifact@v4
@@ -571,6 +630,68 @@ jobs:
           run-id: ${{ inputs.reuse_payload_run_id }}
           github-token: ${{ github.token }}
 
+      - name: Force host DT, add touch firmware and S2MU106 read-only diagnostics
+        run: |
+          set -euxo pipefail
+
+          dtb=source/exynos850-a217f.dtb
+          fdtput -t s "$dtb" /aliases i2c0 /soc@0/i2c@13830000
+          fdtput -t s "$dtb" /soc@0/i2c@13830000 status okay
+          fdtput -t u "$dtb" /soc@0/i2c@13830000 clock-frequency 100000
+          fdtput -t s "$dtb" /soc@0/usb@13600000/usb@0 dr_mode host
+          fdtput -t x "$dtb" \
+            /soc@0/usi@11d000c0/spi@11d00000/touchscreen@0 \
+            vddio-supply 19
+          test "$(fdtget "$dtb" /aliases i2c0)" = /soc@0/i2c@13830000
+          test "$(fdtget "$dtb" /soc@0/i2c@13830000 status)" = okay
+          test "$(fdtget "$dtb" /soc@0/usb@13600000/usb@0 dr_mode)" = host
+          test "$(fdtget -t x "$dtb" \
+            /soc@0/usi@11d000c0/spi@11d00000/touchscreen@0 vddio-supply)" = 19
+
+          firmware="$RUNNER_TEMP/td4150_a21s.bin"
+          curl -fL --retry 3 \
+            "https://raw.githubusercontent.com/samsungexynos850/firmware-samsung-a21s/$A21S_FIRMWARE_COMMIT/td4150_a21s.bin" \
+            -o "$firmware"
+          printf '%s  %s\n' "$A21S_FIRMWARE_SHA512" "$firmware" | sha512sum -c -
+
+          root="$RUNNER_TEMP/a21s-initramfs"
+          mkdir -p "$root"
+          gzip -dc source/initramfs.cpio.gz \
+            | (cd "$root" && cpio -idm --quiet --no-absolute-filenames)
+          install -D -m 0644 "$firmware" "$root/lib/firmware/td4150_a21s.bin"
+          aarch64-linux-gnu-gcc -Os -static -s \
+            .github/patches/a21s-otg-diagnostic.c \
+            -o "$root/bin/a21s-otg-diagnostic"
+
+          python3 .github/patches/patch_a21s_initramfs.py "$root/init"
+
+          (
+            cd "$root"
+            find . -print0 | LC_ALL=C sort -z \
+              | cpio --null --create --format=newc --owner=0:0 --quiet
+          ) | gzip -n -9 > source/initramfs.cpio.gz
+
+          git init uniloader
+          git -C uniloader remote add origin \
+            https://github.com/samsungexynos850/uniLoader.git
+          git -C uniloader fetch --depth=1 origin "$UNILOADER_COMMIT"
+          git -C uniloader checkout --detach FETCH_HEAD
+          git -C uniloader rev-parse HEAD | tee source/uniloader-commit.txt
+          test -f uniloader/configs/a21s_defconfig
+          cp source/Image uniloader/blob/Image
+          cp "$dtb" uniloader/blob/dtb
+          cp source/initramfs.cpio.gz uniloader/blob/ramdisk
+
+          build_dir="$RUNNER_TEMP/uniloader-build"
+          mkdir -p "$build_dir"
+          make -C uniloader O="$build_dir" ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- a21s_defconfig
+          make -C uniloader O="$build_dir" ARCH=aarch64 \
+            CROSS_COMPILE=aarch64-linux-gnu- -j"$(nproc)"
+          test -s "$build_dir/uniLoader"
+          file "$build_dir/uniLoader" "$dtb" source/initramfs.cpio.gz
+          sha256sum "$build_dir/uniLoader" "$dtb" source/initramfs.cpio.gz
+
       - name: Fetch pinned AOSP mkbootimg
         run: |
           set -euxo pipefail
@@ -580,9 +701,9 @@ jobs:
           git -C mkbootimg fetch --depth=1 origin "$MKBOOTIMG_COMMIT"
           git -C mkbootimg checkout --detach FETCH_HEAD
 
-      - name: Repackage with the proven Samsung outer DT table
+      - name: Package rebuilt uniLoader with the proven Samsung outer DT table
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           mkdir -p artifacts
           cp boot/a21s-sboot-compatible-dtb-table.img artifacts/
           python3 - <<'PY'
@@ -591,34 +712,17 @@ jobs:
           import struct
 
           source = Path("source")
-          old = (source / "boot-uniloader-a21s-alpine.img").read_bytes()
-          assert old[:8] == b"ANDROID!"
-          kernel_size, kernel_addr = struct.unpack_from("<II", old, 8)
-          ramdisk_size = struct.unpack_from("<I", old, 16)[0]
-          second_size = struct.unpack_from("<I", old, 24)[0]
-          page_size = struct.unpack_from("<I", old, 36)[0]
-          version = struct.unpack_from("<I", old, 40)[0]
-          assert (version, page_size, kernel_addr, ramdisk_size, second_size) == \
-              (2, 2048, 0x80080000, 0, 0)
-
-          def align(value, page):
-              return (value + page - 1) // page * page
-
-          old_dtb_size = struct.unpack_from("<I", old, 1648)[0]
-          dtb_start = page_size + align(kernel_size, page_size) \
-              + align(ramdisk_size, page_size) + align(second_size, page_size)
-          assert old[dtb_start:dtb_start + 4] == bytes.fromhex("d00dfeed")
-
-          payload = old[page_size:page_size + kernel_size]
+          payload = Path(os.environ["RUNNER_TEMP"], "uniloader-build", "uniLoader").read_bytes()
           for name in ("Image", "exynos850-a217f.dtb", "initramfs.cpio.gz"):
               assert (source / name).read_bytes() in payload, \
-                  f"{name} is missing from the previously verified uniLoader payload"
+                  f"{name} is missing from the rebuilt uniLoader payload"
           Path(os.environ["RUNNER_TEMP"], "uniLoader.raw").write_bytes(payload)
 
+          page_size = 2048
           table = Path("boot/a21s-sboot-compatible-dtb-table.img").read_bytes()
           assert len(table) % page_size == 0
           assert struct.unpack_from(">I", table, 0)[0] == 0xd7b7ab1e
-          print(f"Reusing {len(payload)}-byte uniLoader and {len(table)}-byte known-good outer DT table")
+          print(f"Using {len(payload)}-byte rebuilt uniLoader and {len(table)}-byte known-good outer DT table")
           PY
 
           python3 mkbootimg/mkbootimg.py \
@@ -633,13 +737,13 @@ jobs:
             --tags_offset 0x100 \
             --dtb_offset 0x01f00000 \
             --board exynos850 \
-            --output artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img
+            --output artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img
 
           python3 - <<'PY'
           from pathlib import Path
           import struct
 
-          image = Path("artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img")
+          image = Path("artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img")
           data = image.read_bytes()
           kernel_size, kernel_addr = struct.unpack_from("<II", data, 8)
           ramdisk_size = struct.unpack_from("<I", data, 16)[0]
@@ -676,24 +780,28 @@ jobs:
       - name: Collect repack metadata
         if: always()
         run: |
+          mkdir -p artifacts
           cp source/Image source/exynos850-a217f.dtb source/initramfs.cpio.gz artifacts/ 2>/dev/null || true
           cp source/kernel-commit.txt source/uniloader-commit.txt artifacts/ 2>/dev/null || true
           {
             echo 'Outer DT table: exact table from the A21s probe that reached uniLoader.'
-            echo 'Linux Image, mainline DTB and Alpine initramfs are reused from the source artifact.'
-            echo 'Kernel was not rebuilt by this repack-only job.'
-            echo 'This image still needs a physical boot test; flash target is Boot only.'
+            echo 'The existing Linux Image is reused; the kernel was not rebuilt.'
+            echo 'uniLoader was rebuilt with DWC3 forced to host mode and I2C0 enabled.'
+            echo 'Initramfs contains verified A21s touchscreen firmware and read-only S2MU106 status diagnostics.'
+            echo 'The diagnostic does not write to charger or PMIC registers.'
+            echo 'A21s touchscreen vddio uses the existing dummy regulator entry.'
+            echo 'This is a Boot-partition diagnostic image, not a Recovery image.'
             ls -lh artifacts/ || true
           } > artifacts/README-BOOT-RU.txt
-          if [ -f artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img ]; then
-            sha256sum artifacts/boot-uniloader-a21s-alpine-sboot-dtb.img > artifacts/SHA256SUMS
+          if [ -f artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img ]; then
+            sha256sum artifacts/boot-uniloader-a21s-alpine-usb-host-diagnostic.img > artifacts/SHA256SUMS
           fi
 
-      - name: Upload corrected A21s Boot artifact
+      - name: Upload A21s USB host diagnostic Boot artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: a21s-uniloader-alpine-boot-sboot-dtb
+          name: a21s-uniloader-alpine-usb-host-diagnostic
           path: artifacts/
           if-no-files-found: warn
           retention-days: 14
