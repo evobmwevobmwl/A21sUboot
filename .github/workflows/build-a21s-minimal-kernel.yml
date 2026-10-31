@@ -1,0 +1,131 @@
+name: Build A21s minimal embedded kernel
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/build-a21s-minimal-kernel.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: a21s-minimal-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build small Exynos850 kernel for uniLoader
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential device-tree-compiler \
+            flex gcc-aarch64-linux-gnu git libelf-dev libssl-dev \
+            python3 rsync
+
+      - name: Fetch pinned Samsung Exynos850 Linux source
+        run: |
+          set -eu
+          git init linux
+          git -C linux remote add origin \
+            https://github.com/samsungexynos850/linux.git
+          git -C linux fetch --depth=1 origin \
+            cad9d83aeb26da2df00b435f6c11b6e113dd4345
+          git -C linux checkout --detach FETCH_HEAD
+          git -C linux rev-parse HEAD | tee kernel-commit.txt
+          test -f linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dts
+
+      - name: Configure compact kernel with A21s storage support
+        run: |
+          set -euxo pipefail
+          cd linux
+
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+
+          # Remove large unrelated subsystems while retaining the display,
+          # console, eMMC and userdata filesystems needed for this boot path.
+          for sym in \
+            SOUND MEDIA_SUPPORT USB BT WIRELESS NETFILTER IIO NFC CAN \
+            VIRTIO PCI ACPI KVM BPF BPF_SYSCALL PERF_EVENTS FTRACE \
+            FUNCTION_TRACER KPROBES UPROBE_EVENTS KALLSYMS_ALL \
+            DEBUG_INFO DEBUG_INFO_DWARF5 DEBUG_INFO_BTF DEBUG_KERNEL \
+            KEXEC CRASH_DUMP MODULES; do
+            scripts/config --disable "$sym"
+          done
+
+          for sym in \
+            ARCH_EXYNOS BLK_DEV_INITRD DEVTMPFS DEVTMPFS_MOUNT TMPFS \
+            RD_GZIP BINFMT_ELF MMC MMC_BLOCK MMC_DW MMC_DW_EXYNOS \
+            EXT4_FS F2FS_FS EFI_PARTITION PROC_FS SYSFS \
+            SERIAL_SAMSUNG SERIAL_SAMSUNG_CONSOLE \
+            DRM DRM_SIMPLEDRM FRAMEBUFFER_CONSOLE; do
+            scripts/config --enable "$sym"
+          done
+
+          scripts/config --disable F2FS_FS_COMPRESSION
+
+          make ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+          for sym in \
+            ARCH_EXYNOS BLK_DEV_INITRD DEVTMPFS RD_GZIP MMC MMC_BLOCK \
+            MMC_DW MMC_DW_EXYNOS EXT4_FS F2FS_FS EFI_PARTITION \
+            SERIAL_SAMSUNG; do
+            grep -q "^CONFIG_${sym}=y$" .config
+          done
+
+          cp .config ../kernel.config
+
+      - name: Build kernel Image and A21s DTB
+        run: |
+          set -euxo pipefail
+          cd linux
+          make -j"$(nproc)" ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image dtbs
+
+          image=arch/arm64/boot/Image
+          dtb=arch/arm64/boot/dts/exynos/exynos850-a217f.dtb
+          test -s "$image"
+          test -s "$dtb"
+          size="$(stat -c '%s' "$image")"
+          echo "A21s kernel Image size: $size bytes"
+          if [ "$size" -ge $((32 * 1024 * 1024)) ]; then
+            echo '::error::Kernel Image is too large for a Boot-sized uniLoader image.'
+            exit 1
+          fi
+
+      - name: Collect minimal kernel artifact
+        if: always()
+        run: |
+          mkdir -p out
+          [ ! -f linux/arch/arm64/boot/Image ] || \
+            cp linux/arch/arm64/boot/Image out/Image
+          [ ! -f linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb ] || \
+            cp linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb \
+              out/exynos850-a217f.dtb
+          [ ! -f linux/System.map ] || cp linux/System.map out/
+          [ ! -f kernel.config ] || cp kernel.config out/
+          [ ! -f kernel-commit.txt ] || cp kernel-commit.txt out/
+          {
+            echo 'Target: Samsung Galaxy A21s SM-A217F / Exynos 850'
+            echo 'Kernel: Samsung Exynos850 source pinned to cad9d83aeb26da2df00b435f6c11b6e113dd4345'
+            echo 'Built-in required support: eMMC, ext4, F2FS, initramfs, console'
+            echo 'Purpose: embedded in uniLoader; bootability is not yet confirmed.'
+            ls -lh out || true
+          } > out/build-info.txt
+          [ ! -f out/Image ] || sha256sum out/Image out/exynos850-a217f.dtb > out/SHA256SUMS
+
+      - name: Upload compact A21s kernel
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a21s-minimal-kernel
+          path: out/
+          if-no-files-found: warn
+          retention-days: 14
