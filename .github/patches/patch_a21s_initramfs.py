@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Add source-gated A21s OTG setup and prioritize USB storage in initramfs."""
+import re
 import sys
 from pathlib import Path
 
@@ -23,17 +24,24 @@ if "/bin/a21s-otg-init" not in text:
         raise SystemExit("Could not uniquely find the initramfs device setup marker")
     text = text.replace(setup_anchor, setup_anchor + otg_setup, 1)
 
-old_first = "for dev in /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*"
-new_first = "for dev in /dev/sd[a-z] /dev/sd[a-z][0-9]*"
-old_second = "/dev/sd[a-z] /dev/sd[a-z][0-9]*; do"
-new_second = "/dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do"
-if old_first in text:
-    if text.count(old_first) != 1 or text.count(old_second) != 1:
-        raise SystemExit("Could not uniquely find the old storage scan order")
-    text = text.replace(old_first, new_first, 1)
-    text = text.replace(old_second, new_second, 1)
-elif new_first not in text:
-    raise SystemExit("Could not set USB-first storage scan order")
+usb_scan = "for dev in /dev/sd* /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do"
+scan_patterns = (
+    re.compile(
+        r"for dev in /dev/mmcblk\[0-9\] /dev/mmcblk\[0-9\]p\* \\\n"
+        r"\s*/dev/sd\[a-z\] /dev/sd\[a-z\]\[0-9\]\*; do"
+    ),
+    re.compile(
+        r"for dev in /dev/sd\[a-z\] /dev/sd\[a-z\]\[0-9\]\* \\\n"
+        r"\s*/dev/mmcblk\[0-9\] /dev/mmcblk\[0-9\]p\*; do"
+    ),
+)
+if usb_scan not in text:
+    matches = [pattern for pattern in scan_patterns if pattern.search(text)]
+    if len(matches) != 1:
+        raise SystemExit("Could not uniquely find the storage scan loop")
+    text, count = matches[0].subn(usb_scan, text, count=1)
+    if count != 1:
+        raise SystemExit("Could not update the storage scan loop")
 
 shell_anchor = (
     "echo '[A21s] Emergency shell: inspect /dev, /sys/class/block and mount manually.' "

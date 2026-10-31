@@ -366,8 +366,7 @@ jobs:
 
           attempt=0
           while [ "$attempt" -lt 20 ]; do
-          for dev in /dev/sd[a-z] /dev/sd[a-z][0-9]* \
-                     /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do
+          for dev in /dev/sd* /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do
               [ -b "$dev" ] || continue
 
               for fs in ext4 f2fs vfat exfat; do
