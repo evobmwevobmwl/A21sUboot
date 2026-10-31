@@ -24,7 +24,7 @@ if "/bin/a21s-otg-init" not in text:
         raise SystemExit("Could not uniquely find the initramfs device setup marker")
     text = text.replace(setup_anchor, setup_anchor + otg_setup, 1)
 
-usb_scan = "for dev in /dev/sd* /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do"
+internal_first_scan = "for dev in /dev/mmcblk[0-9] /dev/mmcblk[0-9]p* /dev/sd*; do"
 scan_patterns = (
     re.compile(
         r"for dev in /dev/mmcblk\[0-9\] /dev/mmcblk\[0-9\]p\* \\\n"
@@ -34,20 +34,31 @@ scan_patterns = (
         r"for dev in /dev/sd\[a-z\] /dev/sd\[a-z\]\[0-9\]\* \\\n"
         r"\s*/dev/mmcblk\[0-9\] /dev/mmcblk\[0-9\]p\*; do"
     ),
+    re.compile(
+        r"for dev in /dev/sd\* /dev/mmcblk\[0-9\] /dev/mmcblk\[0-9\]p\*; do"
+    ),
 )
-if usb_scan not in text:
+if internal_first_scan not in text:
     matches = [pattern for pattern in scan_patterns if pattern.search(text)]
     if len(matches) != 1:
         raise SystemExit("Could not uniquely find the storage scan loop")
-    text, count = matches[0].subn(usb_scan, text, count=1)
+    text, count = matches[0].subn(internal_first_scan, text, count=1)
     if count != 1:
         raise SystemExit("Could not update the storage scan loop")
+
+archive_anchor = 'echo "[A21s] Found rootfs archive on $dev ($fs)" >/dev/console\n'
+archive_message = 'echo "[A21s] Found rootfs archive on $dev ($fs): $archive" >/dev/console\n'
+if archive_message not in text:
+    if text.count(archive_anchor) != 1:
+        raise SystemExit("Could not uniquely find the archive-found message")
+    text = text.replace(archive_anchor, archive_message, 1)
 
 shell_anchor = (
     "echo '[A21s] Emergency shell: inspect /dev, /sys/class/block and mount manually.' "
     ">/dev/console\n"
 )
 shell_diagnostics = """\
+echo '[A21s] Android /data may be encrypted; if its archive is inaccessible, copy it to /cache/rootfs.tar.gz or USB.' >/dev/console
 echo '[A21s] OTG/VBUS status:' >/dev/console
 /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
 echo '[A21s] USB block devices:' >/dev/console
@@ -68,4 +79,4 @@ if "[A21s] Registered input event devices:" not in text:
     text = text.replace(shell_anchor, shell_anchor + shell_diagnostics, 1)
 
 init.write_text(text)
-print("Initramfs enables VBUS only on confirmed source attach, scans USB first, and reports USB/input devices")
+print("Initramfs enables VBUS only on confirmed source attach, scans internal storage first, and reports USB/input devices")

@@ -366,7 +366,7 @@ jobs:
 
           attempt=0
           while [ "$attempt" -lt 20 ]; do
-          for dev in /dev/sd* /dev/mmcblk[0-9] /dev/mmcblk[0-9]p*; do
+          for dev in /dev/mmcblk[0-9] /dev/mmcblk[0-9]p* /dev/sd*; do
               [ -b "$dev" ] || continue
 
               for fs in ext4 f2fs vfat exfat; do
@@ -396,7 +396,7 @@ jobs:
                 current_dev="$dev"
                 archive="$(find_archive /mnt/source)"
                 if [ -n "$archive" ]; then
-                  echo "[A21s] Found rootfs archive on $dev ($fs)" >/dev/console
+                  echo "[A21s] Found rootfs archive on $dev ($fs): $archive" >/dev/console
                   boot_from_archive "$archive"
                 fi
 
@@ -408,6 +408,7 @@ jobs:
           done
 
           echo '[A21s] Alpine not found. Check that the rootfs is extracted or rootfs.tar.gz is present.' >/dev/console
+          echo '[A21s] Android /data may be encrypted; if its archive is inaccessible, copy it to /cache/rootfs.tar.gz or USB.' >/dev/console
           echo '[A21s] Emergency shell: inspect /dev, /sys/class/block and mount manually.' >/dev/console
           echo '[A21s] OTG/VBUS status:' >/dev/console
           /bin/busybox cat /run/a21s-otg-status >/dev/console 2>&1 || true
