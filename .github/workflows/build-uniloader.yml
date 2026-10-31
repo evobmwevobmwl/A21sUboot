@@ -433,9 +433,28 @@ jobs:
           git -C mkbootimg checkout --detach FETCH_HEAD
 
           mkdir -p artifacts
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+
+          dtb = Path("linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb").read_bytes()
+          assert dtb[:4] == bytes.fromhex("d00dfeed"), "Linux DTB is not an FDT"
+          fdt_size = struct.unpack_from(">I", dtb, 4)[0]
+          assert 40 <= fdt_size <= len(dtb)
+          dtb = dtb[:fdt_size]
+
+          # Match the single-entry Android DT table used by the A21s probe image.
+          table = struct.pack(">8I", 0xd7b7ab1e, 64 + fdt_size, 32, 32, 1, 32, 2048, 0)
+          table += struct.pack(">8I", fdt_size, 64, 0, 0, 0, 0xff000000, 0, 0)
+          table += dtb
+          table += bytes((-len(table)) % 2048)
+          Path("artifacts/exynos850-a217f-dtb-table.img").write_bytes(table)
+          print(f"A21s Android DT table: {len(table)} bytes; FDT={fdt_size} bytes")
+          PY
+
           python3 mkbootimg/mkbootimg.py \
             --kernel "$RUNNER_TEMP/uniloader-build/uniLoader" \
-            --dtb linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb \
+            --dtb artifacts/exynos850-a217f-dtb-table.img \
             --header_version 2 \
             --pagesize 2048 \
             --base 0x10000000 \
@@ -470,8 +489,27 @@ jobs:
           dtb_addr = struct.unpack_from("<Q", data, 1652)[0]
           assert dtb_size > 0
           assert dtb_addr == 0x11F00000
+          align = lambda value, page: (value + page - 1) // page * page
+          dtb_start = page_size + align(kernel_size, page_size) \
+              + align(ramdisk_size, page_size) + align(second_size, page_size)
+          table = data[dtb_start:dtb_start + dtb_size]
+          magic, total_size, header_size, entry_size, count, entries_offset, table_page, version = \
+              struct.unpack_from(">8I", table)
+          assert (magic, header_size, entry_size, count, entries_offset, table_page, version) == \
+              (0xd7b7ab1e, 32, 32, 1, 32, 2048, 0)
+          fdt_size, fdt_offset, dt_id, dt_rev, custom0, custom1, custom2, custom3 = \
+              struct.unpack_from(">8I", table, 32)
+          assert total_size == 64 + fdt_size
+          assert fdt_offset == 64
+          assert table[fdt_offset:fdt_offset + 4] == bytes.fromhex("d00dfeed")
+          assert custom1 == 0xff000000
+          payload = data[page_size:page_size + kernel_size]
+          for path in ("linux/arch/arm64/boot/Image",
+                       "linux/arch/arm64/boot/dts/exynos/exynos850-a217f.dtb",
+                       "uniloader/blob/ramdisk"):
+              assert pathlib.Path(path).read_bytes() in payload, f"{path} not embedded in uniLoader"
           print(f"Android boot v{header_version}; kernel={kernel_size} bytes; "
-                f"addr=0x{kernel_addr:08x}; dtb={dtb_size} bytes at {dtb_addr:#x}")
+                f"addr=0x{kernel_addr:08x}; DT table={dtb_size} bytes at {dtb_addr:#x}")
           print(f"ramdisk_addr=0x{ramdisk_addr:08x}; tags_addr=0x{tags_addr:08x}; "
                 f"page_size={page_size}; image={image.stat().st_size} bytes")
           PY
@@ -498,6 +536,7 @@ jobs:
             echo 'Kernel was built with A21s source config plus USB dual-role and F2FS.'
             echo 'Kernel includes USB DWC3 dual-role, USB storage, F2FS, ext4, VFAT and exFAT.'
             echo 'Initramfs scans eMMC, SD and USB block devices; rootfs archives are extracted to RAM.'
+            echo 'The outer A21s DTB uses a single-entry Android DT table wrapper.'
             echo 'The image is a Boot-partition test image. It is not a Recovery image.'
             echo 'Physical Linux/Alpine boot is not yet verified.'
             echo
